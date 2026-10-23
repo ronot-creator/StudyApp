@@ -100,3 +100,18 @@ CREATE TABLE IF NOT EXISTS mindmap_edges (
     linking_phrase TEXT NOT NULL CHECK (length(linking_phrase) <= 240), -- Short linking phrase (~20-30 words max)
     is_cross_system_bridge INTEGER NOT NULL DEFAULT 0 CHECK (is_cross_system_bridge IN (0, 1))
 );
+
+-- 7. Offline Grading Queue (written answers cached while the Ngrok tunnel is down; replayed on reconnect)
+CREATE TABLE IF NOT EXISTS grading_queue (
+    id TEXT PRIMARY KEY,
+    card_id TEXT NOT NULL,
+    question_prompt TEXT NOT NULL,
+    mark_scheme TEXT NOT NULL,
+    user_answer TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','graded','failed')),
+    result_json TEXT,
+    graded_at TEXT
+);

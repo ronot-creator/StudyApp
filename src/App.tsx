@@ -1,9 +1,9 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import TunnelStatus from "./components/TunnelStatus";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"vault" | "srs" | "mindmap">("vault");
-  const [ngrokUrl, setNgrokUrl] = useState<string>("");
   const [statusMsg, setStatusMsg] = useState<string>("Ready (Sandbox: E:\\StudyApp\\MyFiles\\)");
 
   const mountGeminiPanel = async () => {
@@ -32,13 +32,7 @@ export default function App() {
           Launch Gemini WebView (persist:study_session)
         </button>
         <div style={{ marginTop: "auto" }}>
-          <label style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}>Colab 3B Ngrok Tunnel URL</label>
-          <input
-            value={ngrokUrl}
-            onChange={(e) => setNgrokUrl(e.target.value)}
-            placeholder="https://xxxx.ngrok-free.app"
-            style={{ width: "100%", padding: "6px", borderRadius: "4px", border: "1px solid #334155", background: "#1e293b", color: "#fff" }}
-          />
+          <TunnelStatus />
         </div>
       </aside>
       <main style={{ flex: 1, padding: "24px", overflowY: "auto" }}>
