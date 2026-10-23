@@ -1,0 +1,42 @@
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/WixTools/
+*.pdb
+
+# Node / Frontend dependencies & build
+node_modules/
+dist/
+.vite/
+
+# Python virtual environments & cache
+mcp-server/.venv/
+mcp-server/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local Storage Sandbox (E:\StudyApp\MyFiles\) - Exclude large PDFs, images, and runtime DB binaries
+MyFiles/vault/*.pdf
+MyFiles/vault/*.md
+!MyFiles/vault/.gitkeep
+MyFiles/images/*
+!MyFiles/images/.gitkeep
+MyFiles/srs_data/*.db
+MyFiles/srs_data/*.sqlite
+MyFiles/srs_data/*.sqlite3
+MyFiles/srs_data/*.db-wal
+MyFiles/srs_data/*.db-shm
+!MyFiles/srs_data/schema.sql
+!MyFiles/srs_data/.gitkeep
+
+# Persistent WebView session partition data
+MyFiles/.webview_partitions/
+.webview_partitions/
+
+# Environment variables & Ngrok secrets
+.env
+.env.local
+*.log
+.DS_Store
+Thumbs.db
