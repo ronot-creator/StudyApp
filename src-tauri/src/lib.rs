@@ -134,6 +134,21 @@ pub fn enforce_e_drive_sandbox(candidate: &PathBuf) -> Result<PathBuf, String> {
     }
 }
 
+/// Embedded canonical schema (MyFiles/srs_data/schema.sql)
+const SCHEMA_SQL: &str = include_str!("../../MyFiles/srs_data/schema.sql");
+
+/// Applies `schema.sql` to `E:\StudyApp\MyFiles\srs_data\studyapp_srs.db` with foreign keys enabled.
+pub fn init_database() -> Result<(), String> {
+    let dir = PathBuf::from(SANDBOX_ROOT).join("srs_data");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create srs_data: {e}"))?;
+    let db_path = dir.join("studyapp_srs.db");
+    enforce_e_drive_sandbox(&db_path)?;
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
+    conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Spawns the local Python MCP server (`mcp-server/src/server.py`) on startup
 fn spawn_mcp_sidecar() -> Option<Child> {
     let server_script = PathBuf::from(r"E:\StudyApp\mcp-server\src\server.py");
@@ -143,7 +158,7 @@ fn spawn_mcp_sidecar() -> Option<Child> {
     Command::new("python")
         .args(["-m", "src.server"])
         .current_dir(r"E:\StudyApp\mcp-server")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -152,7 +167,7 @@ fn spawn_mcp_sidecar() -> Option<Child> {
 
 /// Forwards user text selection from the Vault Reader UI to `127.0.0.1:47821/highlight`
 #[tauri::command]
-pub async fn update_active_highlight(
+async fn update_active_highlight(
     active_file: String,
     selected_text: String,
     surrounding_context: String,
@@ -178,7 +193,7 @@ pub async fn update_active_highlight(
 /// Any previously docked AI Web-View is unmounted from live GPU memory while preserving its cookies/IndexedDB
 /// inside `E:\StudyApp\MyFiles\.webview_partitions\persist_study_session`.
 #[tauri::command]
-pub fn switch_active_ai_panel(
+fn switch_active_ai_panel(
     app: tauri::AppHandle,
     state: State<'_, AppRuntimeState>,
     provider: String,
@@ -243,7 +258,7 @@ pub fn switch_active_ai_panel(
 
 /// Legacy compatibility alias that delegates to `switch_active_ai_panel`
 #[tauri::command]
-pub fn mount_persistent_ai_panel(
+fn mount_persistent_ai_panel(
     app: tauri::AppHandle,
     state: State<'_, AppRuntimeState>,
     panel_label: String,
@@ -270,7 +285,7 @@ pub fn mount_persistent_ai_panel(
 /// Undocks the specified AI provider from the `main` split-pane and spawns a native floating desktop window
 /// sharing `persist:study_session`.
 #[tauri::command]
-pub fn detach_ai_panel(
+fn detach_ai_panel(
     app: tauri::AppHandle,
     state: State<'_, AppRuntimeState>,
     provider: String,
@@ -332,7 +347,7 @@ pub fn detach_ai_panel(
 
 /// Closes a detached floating AI window and seamlessly re-docks the provider into the `main` split-pane
 #[tauri::command]
-pub fn redock_ai_panel(
+fn redock_ai_panel(
     app: tauri::AppHandle,
     state: State<'_, AppRuntimeState>,
     provider: String,
@@ -361,7 +376,7 @@ pub fn redock_ai_panel(
 
 /// Syncs the native docked child Web-View bounds whenever the user drags the React split-pane divider
 #[tauri::command]
-pub fn resize_docked_ai_panel(
+fn resize_docked_ai_panel(
     app: tauri::AppHandle,
     state: State<'_, AppRuntimeState>,
     x: f64,
@@ -391,6 +406,9 @@ pub fn resize_docked_ai_panel(
 pub fn run() {
     // Enforce WebView2 RAM Diet & Lag Optimization before initializing Tauri
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", WEBVIEW2_RAM_DIET_ARGS);
+    // E:\ Law: main window and all child WebViews share one E:\ WebView2 profile (never C:\ AppData)
+    let _ = std::fs::create_dir_all(STUDY_SESSION_PARTITION_DIR);
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", STUDY_SESSION_PARTITION_DIR);
 
     tauri::Builder::default()
         .manage(AppRuntimeState::default())
@@ -410,10 +428,16 @@ pub fn run() {
                 let _ = std::fs::create_dir_all(&dir);
             }
 
+            // Build/upgrade the SQLite schema before anything touches the DB
+            if let Err(e) = init_database() {
+                eprintln!("[StudyApp] SQLite schema init failed: {e}");
+            }
+
             // Spawn Python MCP sidecar server
             if let Some(child) = spawn_mcp_sidecar() {
                 let state = app.state::<AppRuntimeState>();
-                if let Ok(mut guard) = state.mcp_sidecar.lock() {
+                let lock_result = state.mcp_sidecar.lock();
+                if let Ok(mut guard) = lock_result {
                     *guard = Some(child);
                 }
             }

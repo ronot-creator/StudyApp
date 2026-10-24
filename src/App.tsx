@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles/liquid-glass.css";
 import { AiProviderId, CANONICAL_ORGAN_SYSTEMS, OrganSystem } from "./types/study";

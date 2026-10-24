@@ -198,8 +198,8 @@ async def extract_mindmap_triples(
     if not triples:
         sys_prompt = (
             "Extract physiological flowchart triples from the text. Each linking_phrase must be <= 25 words. "
-            "Return JSON: {"triples": [{"source_node": "...", "linking_phrase": "...", "
-            ""target_node": "...", "is_cross_system_bridge": false}]}"
+            '"Return JSON: {\"triples\": [{\"source_node\": \"...\", \"linking_phrase\": \"...\", "'
+'            "\"target_node\": \"...\", \"is_cross_system_bridge\": false}]}"'
         )
         parsed = await query_ollama_json(sys_prompt, req.markdown_text[:4000])
         for item in parsed.get("triples", []):
@@ -226,7 +226,7 @@ async def auto_tag(
         "Classify this medical note into one primary organ_system (Renal, Cardiovascular, Respiratory, "
         "Gastrointestinal, Neurology, Endocrine, Musculoskeletal, Reproductive, Hematology/Oncology, "
         "Immunology, Integumentary, Multisystem/General) and up to 5 high-yield physiological keywords. "
-        "Return JSON: {"organ_system": "...", "keywords": [...]}"
+        "Return JSON: {\"organ_system\": \"...\", \"keywords\": [...]}"
     )
     parsed = await query_ollama_json(sys_prompt, req.markdown_text[:3000])
     return {
@@ -244,7 +244,7 @@ async def generate_specimen_queries(
     sys_prompt = (
         "Generate targeted search queries for open-access medical image & 3D repositories "
         "(NIH Open-i, Wikimedia Commons Medical, PEIR Pathology, Sketchfab 3D Anatomy). "
-        "Return JSON: {"queries": [{"modality": "...", "search_query": "...", "expected_structure": "..."}]}"
+        "Return JSON: {\"queries\": [{\"modality\": \"...\", \"search_query\": \"...\", \"expected_structure\": \"...\"}]}"
     )
     user_prompt = f"System: {req.organ_system}\nTopic: {req.topic_summary}\nModalities: {req.modalities}"
     parsed = await query_ollama_json(sys_prompt, user_prompt)

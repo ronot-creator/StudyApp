@@ -182,8 +182,7 @@ export const MindMapCanvas: React.FC = () => {
                     : t.target_node
                 }]`
             )
-            .join("
-");
+            .join("\n");
           setSyntaxInput(formatted);
         }
       }
