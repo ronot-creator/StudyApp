@@ -57,6 +57,7 @@ export interface SrsCard {
   scheduledDays: number;
   reps: number;
   lapses: number;
+  learningStep?: number; // index into learning/relearning steps (states 1 and 3)
   state: 0 | 1 | 2 | 3; // 0=New, 1=Learning, 2=Review, 3=Relearning
   dueDate: string;
   lastReview?: string;

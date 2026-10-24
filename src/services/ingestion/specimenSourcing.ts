@@ -74,6 +74,9 @@ export const DEFAULT_CURATED_REPOSITORIES: CuratedRepository[] = [
 ];
 
 export class SpecimenSourcingService {
+  /** Optional UI hook (toast/alert) invoked when a DB write fails. */
+  public onPersistError?: (message: string) => void;
+
   /**
    * Queries Wikimedia Commons Medical & NIH Open-i / Sketchfab 3D APIs for novel anatomical specimens,
    * generates dynamic Image Occlusion bounding boxes, and persists attribution to `medical_images` in SQLite.
@@ -178,8 +181,9 @@ export class SpecimenSourcingService {
           JSON.stringify(asset.occlusionBoxes),
         ]
       );
-    } catch {
-      // Safe no-op in browser preview mode without Tauri SQLite plugin
+    } catch (err) {
+      console.error("[SpecimenSourcing] persistAssetToSqlite failed:", err);
+      this.onPersistError?.(`Specimen metadata NOT saved to SQLite: ${String(err)}`);
     }
   }
 }

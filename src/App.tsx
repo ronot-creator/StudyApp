@@ -41,6 +41,17 @@ export default function App() {
   const [specimenModality, setSpecimenModality] = useState<SpecimenModality>("histology_slide");
   const [sourcedAssets, setSourcedAssets] = useState<SourcedMedicalAsset[]>([]);
   const [isSourcing, setIsSourcing] = useState<boolean>(false);
+  const [dbToast, setDbToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    specimenSourcingService.onPersistError = (msg) => {
+      setDbToast(msg);
+      window.setTimeout(() => setDbToast(null), 6000);
+    };
+    return () => {
+      specimenSourcingService.onPersistError = undefined;
+    };
+  }, []);
 
   const computeRightPaneBounds = () => {
     const el = rightPaneRef.current;
@@ -149,6 +160,15 @@ export default function App() {
 
   return (
     <div className="liquid-shell">
+      {dbToast && (
+        <div
+          role="alert"
+          className="liquid-card"
+          style={{ position: "fixed", bottom: 16, left: 16, zIndex: 50, maxWidth: 420, fontSize: 12.5 }}
+        >
+          {dbToast}
+        </div>
+      )}
       {/* Top Navigation & Tunnel Telemetry Bar */}
       <header className="liquid-topbar">
         <div className="liquid-brand">

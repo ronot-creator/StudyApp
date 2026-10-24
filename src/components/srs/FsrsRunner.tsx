@@ -1,101 +1,18 @@
 import React, { useEffect, useState } from "react";
 import { SrsCard, ColabGradeResponse, OcclusionBox } from "../../types/study";
-import { computeNextFsrsState, persistFsrsReview, FsrsGrade } from "../../lib/fsrs";
+import {
+  computeNextFsrsState,
+  persistFsrsReview,
+  loadDueCards,
+  FsrsGrade,
+  FsrsScheduleOutcome,
+} from "../../lib/fsrs";
 import { getNgrokGrader } from "../../services/ngrokGrader";
 
-const SEED_CLINICAL_CARDS: SrsCard[] = [
-  {
-    id: "card_renal_tgf_01",
-    organSystem: "Renal",
-    cardType: "written",
-    questionOrder: 3,
-    frontPrompt:
-      "A patient with bilateral renal artery stenosis is started on Lisinopril. Explain the physiological mechanism by which efferent arteriolar dilation precipitates an acute drop in GFR.",
-    markScheme:
-      "Angiotensin II preferentially constricts the efferent arteriole via AT1 receptors to preserve glomerular capillary hydrostatic pressure (P_GC) when renal perfusion is reduced. ACE inhibition blocks Angiotensin II synthesis, dilating the efferent arteriole, reducing P_GC, and acutely lowering filtration fraction and GFR.",
-    stability: 2.4,
-    difficulty: 5.2,
-    elapsedDays: 2,
-    scheduledDays: 3,
-    reps: 1,
-    lapses: 0,
-    state: 2,
-    dueDate: new Date().toISOString(),
-  },
-  {
-    id: "card_cardio_mcq_02",
-    organSystem: "Cardiovascular",
-    cardType: "mcq",
-    questionOrder: 2,
-    frontPrompt:
-      "During isovolumetric ventricular contraction of the cardiac cycle, which of the following valvular and pressure states is present?",
-    markScheme:
-      "Both the mitral (AV) and aortic (semilunar) valves are closed while left ventricular pressure rises steeply between mitral closure (S1) and aortic opening.",
-    mcqOptionsJson: JSON.stringify([
-      "Mitral valve open, aortic valve closed; ventricular volume increasing",
-      "Both mitral and aortic valves closed; ventricular pressure rising at constant volume",
-      "Mitral valve closed, aortic valve open; blood ejecting into ascending aorta",
-      "Both mitral and aortic valves open; rapid ventricular filling",
-    ]),
-    mcqCorrectIndex: 1,
-    stability: 4.1,
-    difficulty: 4.4,
-    elapsedDays: 3,
-    scheduledDays: 4,
-    reps: 2,
-    lapses: 0,
-    state: 2,
-    dueDate: new Date().toISOString(),
-  },
-  {
-    id: "card_renal_occ_03",
-    organSystem: "Renal",
-    cardType: "image_occlusion",
-    questionOrder: 2,
-    frontPrompt:
-      "Identify the occluded structures of the Juxtaglomerular Apparatus and Glomerular Filtration Barrier before clicking each glassmorphic mask to reveal.",
-    markScheme:
-      "1. Macula Densa (NaCl sensor in thick ascending limb), 2. Juxtaglomerular Granular Cells (renin secretion in afferent arteriole), 3. Efferent Arteriole (AT1 receptor target).",
-    imagePath: "E:/StudyApp/MyFiles/images/renal_juxtaglomerular_apparatus.png",
-    occlusionBoxesJson: JSON.stringify([
-      {
-        id: "occ_jga_1",
-        label_text: "Macula Densa (NKCC2 NaCl Sensor — Distal Tubule)",
-        x_pct: 12,
-        y_pct: 20,
-        width_pct: 34,
-        height_pct: 14,
-      },
-      {
-        id: "occ_jga_2",
-        label_text: "Juxtaglomerular Granular Cells (Afferent Arteriole — Renin)",
-        x_pct: 54,
-        y_pct: 26,
-        width_pct: 36,
-        height_pct: 14,
-      },
-      {
-        id: "occ_jga_3",
-        label_text: "Efferent Arteriole (High Resistance Outflow — AT1 Target)",
-        x_pct: 28,
-        y_pct: 64,
-        width_pct: 38,
-        height_pct: 14,
-      },
-    ]),
-    stability: 3.0,
-    difficulty: 4.9,
-    elapsedDays: 1,
-    scheduledDays: 3,
-    reps: 1,
-    lapses: 0,
-    state: 2,
-    dueDate: new Date().toISOString(),
-  },
-];
-
 export const FsrsRunner: React.FC = () => {
-  const [cards, setCards] = useState<SrsCard[]>(SEED_CLINICAL_CARDS);
+  const [cards, setCards] = useState<SrsCard[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [toast, setToast] = useState<string | null>(null);
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [writtenAnswer, setWrittenAnswer] = useState<string>("");
   const [selectedMcqIdx, setSelectedMcqIdx] = useState<number | null>(null);
@@ -105,14 +22,56 @@ export const FsrsRunner: React.FC = () => {
   const [replayBanner, setReplayBanner] = useState<string | null>(null);
   const [cardStartTime, setCardStartTime] = useState<number>(Date.now());
 
-  const currentCard = cards[currentIndex] || cards[0];
+  const showToast = (msg: string) => {
+    setToast(msg);
+    window.setTimeout(() => setToast(null), 6000);
+  };
+
+  const reloadCards = async () => {
+    setIsLoading(true);
+    try {
+      const loaded = await loadDueCards();
+      setCards(loaded);
+      setCurrentIndex(0);
+    } catch (err) {
+      console.error("[FsrsRunner] Failed to load cards from SQLite:", err);
+      showToast(`Could not load cards from studyapp_srs.db: ${String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void reloadCards();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Persists a review; on DB failure logs + toasts and still returns the in-memory outcome. */
+  const safePersist = async (
+    card: SrsCard,
+    grade: FsrsGrade,
+    answer: string,
+    model: string,
+    feedback: string,
+    durationMs: number
+  ): Promise<FsrsScheduleOutcome> => {
+    try {
+      return await persistFsrsReview(card, grade, answer, model, feedback, durationMs);
+    } catch (err) {
+      console.error("[FsrsRunner] persistFsrsReview failed:", err);
+      showToast(`Review NOT saved to SQLite: ${String(err)}`);
+      return computeNextFsrsState(card, grade);
+    }
+  };
+
+  const currentCard: SrsCard | undefined = cards[currentIndex] || cards[0];
 
   useEffect(() => {
     const grader = getNgrokGrader();
     const unsubscribe = grader.onReplayGraded(async (replayed) => {
       const targetCard = cards.find((c) => c.id === replayed.cardId);
       if (targetCard) {
-        const outcome = await persistFsrsReview(
+        const outcome = await safePersist(
           targetCard,
           replayed.grade,
           "[Auto-Replayed from SQLite Queue]",
@@ -124,7 +83,7 @@ export const FsrsRunner: React.FC = () => {
           prev.map((c) => (c.id === outcome.updatedCard.id ? outcome.updatedCard : c))
         );
         setReplayBanner(
-          `Replayed queued card "${targetCard.id}" via Colab 3B — Grade ${replayed.grade}/5 (Next due in ${outcome.scheduledDays}d)`
+          `Replayed queued card "${targetCard.id}" via Colab 3B — Grade ${replayed.grade}/5 (Next due in ${outcome.intervalLabel})`
         );
       }
     });
@@ -145,7 +104,7 @@ export const FsrsRunner: React.FC = () => {
     setIsChecking(false);
 
     if (!res.queuedOffline) {
-      const outcome = await persistFsrsReview(
+      const outcome = await safePersist(
         currentCard,
         res.grade,
         writtenAnswer,
@@ -164,7 +123,7 @@ export const FsrsRunner: React.FC = () => {
     const isCorrect = idx === currentCard.mcqCorrectIndex;
     const autoGrade: FsrsGrade = isCorrect ? 4 : 1;
     const duration = Date.now() - cardStartTime;
-    const outcome = await persistFsrsReview(
+    const outcome = await safePersist(
       currentCard,
       autoGrade,
       `MCQ Option #${idx + 1}`,
@@ -179,7 +138,7 @@ export const FsrsRunner: React.FC = () => {
 
   const handleManualFsrsRate = async (grade: FsrsGrade) => {
     const duration = Date.now() - cardStartTime;
-    const outcome = await persistFsrsReview(
+    const outcome = await safePersist(
       currentCard,
       grade,
       "Image Occlusion / Active Recall Self-Evaluation",
@@ -199,19 +158,60 @@ export const FsrsRunner: React.FC = () => {
     setGradingResult(null);
     setRevealedMasks({});
     setCardStartTime(Date.now());
-    setCurrentIndex((prev) => (prev + 1) % cards.length);
+    setCurrentIndex((prev) => (prev + 1) % Math.max(1, cards.length));
   };
 
-  const mcqOptions: string[] = currentCard.mcqOptionsJson
-    ? JSON.parse(currentCard.mcqOptionsJson)
-    : [];
-  const occlusionBoxes: OcclusionBox[] = currentCard.occlusionBoxesJson
-    ? JSON.parse(currentCard.occlusionBoxesJson)
-    : [];
+  const toastEl = toast ? (
+    <div
+      role="alert"
+      className="liquid-card"
+      style={{
+        borderColor: "rgba(251, 113, 133, 0.55)",
+        background: "rgba(127, 29, 29, 0.4)",
+        padding: "10px 14px",
+        fontSize: "12.5px",
+      }}
+    >
+      {toast}
+    </div>
+  ) : null;
+
+  if (!currentCard) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+        {toastEl}
+        <div className="liquid-card">
+          <h3 style={{ margin: "0 0 8px 0", fontSize: "16px" }}>
+            {isLoading ? "Loading due cards from SQLite..." : "No cards due"}
+          </h3>
+          {!isLoading && (
+            <p style={{ fontSize: "13px", color: "#94a3b8", margin: "0 0 12px 0" }}>
+              No cards in <code>srs_cards</code> are due or in the New/Learning state.
+            </p>
+          )}
+          <button className="liquid-btn" onClick={() => void reloadCards()} disabled={isLoading}>
+            Reload
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const safeParse = <T,>(raw: string | undefined, fallback: T): T => {
+    if (!raw) return fallback;
+    try {
+      return JSON.parse(raw) as T;
+    } catch (err) {
+      console.error("[FsrsRunner] Malformed card JSON:", err);
+      return fallback;
+    }
+  };
+  const mcqOptions: string[] = safeParse<string[]>(currentCard.mcqOptionsJson, []);
+  const occlusionBoxes: OcclusionBox[] = safeParse<OcclusionBox[]>(currentCard.occlusionBoxesJson, []);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-      {replayBanner && (
+      {toastEl}      {replayBanner && (
         <div
           className="liquid-card"
           style={{
@@ -292,6 +292,11 @@ export const FsrsRunner: React.FC = () => {
               <div style={{ marginTop: "10px", fontSize: "13px", color: "#94a3b8" }}>
                 <strong>Physiological Rationale:</strong> {currentCard.markScheme}
               </div>
+            )}
+            {selectedMcqIdx !== null && (
+              <button className="liquid-btn" style={{ alignSelf: "flex-start" }} onClick={nextCard}>
+                Next Card &rarr;
+              </button>
             )}
           </div>
         )}
@@ -449,7 +454,7 @@ export const FsrsRunner: React.FC = () => {
                     onClick={() => handleManualFsrsRate(g)}
                     style={{ flex: 1 }}
                   >
-                    Grade {g} ({preview.scheduledDays}d)
+                    Grade {g} ({preview.intervalLabel})
                   </button>
                 );
               })}

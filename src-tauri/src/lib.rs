@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
@@ -121,11 +121,53 @@ pub fn resolve_ai_provider(provider: &str) -> Result<(String, String, String, St
     }
 }
 
-/// Validates that any requested path resides strictly inside `E:\StudyApp\MyFiles\`
-pub fn enforce_e_drive_sandbox(candidate: &PathBuf) -> Result<PathBuf, String> {
-    let root = PathBuf::from(SANDBOX_ROOT);
-    if candidate.starts_with(&root) {
-        Ok(candidate.clone())
+/// Canonicalises `path` even when it does not exist yet by resolving the deepest existing ancestor
+/// (following symlinks / `..`) and re-appending the remaining, already-normalised components.
+fn canonicalize_lenient(path: &Path) -> Result<PathBuf, String> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(mut base) => {
+                for part in tail.iter().rev() {
+                    base.push(part);
+                }
+                return Ok(base);
+            }
+            Err(_) => {
+                let name = cursor
+                    .file_name()
+                    .ok_or_else(|| format!("Cannot resolve path {:?}", path))?
+                    .to_os_string();
+                if name == ".." {
+                    return Err(format!("Unresolvable '..' segment in {:?}", path));
+                }
+                tail.push(name);
+                if !cursor.pop() {
+                    return Err(format!("Cannot resolve path {:?}", path));
+                }
+            }
+        }
+    }
+}
+
+/// Validates that a (relative or absolute) path resolves strictly inside `E:\StudyApp\MyFiles\`.
+/// Relative inputs are joined onto the sandbox root. The path is canonicalised first, so `../`
+/// traversal, symlink escapes and sibling-prefix tricks (`MyFiles_evil`) are all rejected.
+/// Returns the canonical, validated path.
+pub fn enforce_e_drive_sandbox(candidate: &Path) -> Result<PathBuf, String> {
+    let _ = std::fs::create_dir_all(SANDBOX_ROOT);
+    let root = std::fs::canonicalize(SANDBOX_ROOT)
+        .map_err(|e| format!("Sandbox root unavailable: {e}"))?;
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        PathBuf::from(SANDBOX_ROOT).join(candidate)
+    };
+    let resolved = canonicalize_lenient(&joined)?;
+    // `Path::starts_with` compares whole components, so `MyFiles_evil` does not match `MyFiles`.
+    if resolved.starts_with(&root) {
+        Ok(resolved)
     } else {
         Err(format!(
             "Constitution Violation: Path {:?} is outside the E:\\StudyApp\\MyFiles sandbox.",
@@ -141,11 +183,31 @@ const SCHEMA_SQL: &str = include_str!("../../MyFiles/srs_data/schema.sql");
 pub fn init_database() -> Result<(), String> {
     let dir = PathBuf::from(SANDBOX_ROOT).join("srs_data");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create srs_data: {e}"))?;
-    let db_path = dir.join("studyapp_srs.db");
-    enforce_e_drive_sandbox(&db_path)?;
+    let db_path = enforce_e_drive_sandbox(&dir.join("studyapp_srs.db"))?;
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
+
+    // Migration: databases created before FSRS-5 lack `srs_cards.learning_step`.
+    let has_learning_step: bool = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(srs_cards)")
+            .map_err(|e| e.to_string())?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| e.to_string())?;
+        let mut found = false;
+        for n in names {
+            if n.map_err(|e| e.to_string())? == "learning_step" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_learning_step {
+        conn.execute_batch("ALTER TABLE srs_cards ADD COLUMN learning_step INTEGER NOT NULL DEFAULT 0;")
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -172,9 +234,18 @@ async fn update_active_highlight(
     selected_text: String,
     surrounding_context: String,
 ) -> Result<String, String> {
+    // Sandbox gate: reject `../` escapes before the path ever reaches the Python bridge.
+    let validated = enforce_e_drive_sandbox(Path::new(&active_file))?;
+    let root = std::fs::canonicalize(SANDBOX_ROOT).map_err(|e| e.to_string())?;
+    let relative_file = validated
+        .strip_prefix(&root)
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
-        "active_file": active_file,
+        "active_file": relative_file,
         "selected_text": selected_text,
         "surrounding_context": surrounding_context,
     });
@@ -189,9 +260,13 @@ async fn update_active_highlight(
     Ok("synced".to_string())
 }
 
-/// Hot-swaps the active docked AI Web-View inside the `main` window using the Warm-1 RAM Pool:
-/// Any previously docked AI Web-View is unmounted from live GPU memory while preserving its cookies/IndexedDB
-/// inside `E:\StudyApp\MyFiles\.webview_partitions\persist_study_session`.
+/// Hot-swaps the active docked AI Web-View inside the `main` window using the Warm-1 RAM Pool.
+///
+/// Each provider owns exactly one native child webview (unique label `ai_panel_<provider>`). Switching
+/// never destroys a webview: the previously docked panel is `hide()`-den (DOM, cookies, and JS state stay
+/// resident) and the target is either `show()`-n (if already warm) or created once. Because panel labels
+/// are looked up before creation, label collisions cannot occur. Cookies/IndexedDB persist in the shared
+/// `E:\StudyApp\MyFiles\.webview_partitions\persist_study_session` profile.
 #[tauri::command]
 fn switch_active_ai_panel(
     app: tauri::AppHandle,
@@ -203,49 +278,85 @@ fn switch_active_ai_panel(
     height: f64,
 ) -> Result<AiPanelStatus, String> {
     let norm_provider = provider.to_lowercase();
-    let (panel_label, _float_label, target_url, _title) = resolve_ai_provider(&norm_provider)?;
+    let (panel_label, float_label, target_url, _title) = resolve_ai_provider(&norm_provider)?;
 
-    // Warm-1 Pool Hibernation: Close any currently docked child webview from live GPU RAM
-    {
-        let mut active_guard = state
-            .active_docked_provider
-            .lock()
-            .map_err(|e| format!("Mutex lock error: {e}"))?;
+    // Holding this lock for the whole swap serialises concurrent switch/redock requests.
+    let mut active_guard = state
+        .active_docked_provider
+        .lock()
+        .map_err(|e| format!("Mutex lock error: {e}"))?;
 
-        if let Some(prev_provider) = active_guard.as_ref() {
-            if let Ok((prev_label, _, _, _)) = resolve_ai_provider(prev_provider) {
-                if let Some(existing_wv) = app.get_webview(&prev_label) {
-                    let _ = existing_wv.close();
-                }
-            }
+    // A provider that currently lives in a floating window cannot also be docked: focus the float.
+    let is_detached = state
+        .detached_providers
+        .lock()
+        .map_err(|e| format!("Mutex lock error: {e}"))?
+        .contains_key(&norm_provider);
+    if is_detached {
+        if let Some(win) = app.get_webview_window(&float_label) {
+            let _ = win.set_focus();
+            return Ok(AiPanelStatus {
+                provider: norm_provider,
+                mode: "detached".to_string(),
+                label: float_label,
+                target_url,
+                partition_dir: STUDY_SESSION_PARTITION_DIR.to_string(),
+            });
         }
-        *active_guard = Some(norm_provider.clone());
     }
 
-    let data_dir = PathBuf::from(STUDY_SESSION_PARTITION_DIR);
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("Failed to create persist_study_session directory: {e}"))?;
+    // (a) Fully hide the previously docked webview BEFORE touching the new one.
+    if let Some(prev_provider) = active_guard.clone() {
+        if prev_provider != norm_provider {
+            let (prev_label, _, _, _) = resolve_ai_provider(&prev_provider)?;
+            if let Some(prev_wv) = app.get_webview(&prev_label) {
+                prev_wv
+                    .hide()
+                    .map_err(|e| format!("Failed to hide previous panel '{prev_label}': {e}"))?;
+            }
+        }
+    }
 
-    let main_window = app
-        .get_window("main")
-        .ok_or_else(|| "Main window 'main' not found".to_string())?;
+    // (b)+(c) Reuse the warm webview if its label exists; only create when absent.
+    if let Some(existing) = app.get_webview(&panel_label) {
+        existing
+            .set_position(LogicalPosition::new(x, y))
+            .map_err(|e| format!("Failed to reposition '{panel_label}': {e}"))?;
+        existing
+            .set_size(LogicalSize::new(width, height))
+            .map_err(|e| format!("Failed to resize '{panel_label}': {e}"))?;
+        existing
+            .show()
+            .map_err(|e| format!("Failed to show '{panel_label}': {e}"))?;
+    } else {
+        let data_dir = PathBuf::from(STUDY_SESSION_PARTITION_DIR);
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| format!("Failed to create persist_study_session directory: {e}"))?;
 
-    let parsed_url: url::Url = target_url
-        .parse()
-        .map_err(|e| format!("Invalid provider URL: {e}"))?;
+        let main_window = app
+            .get_window("main")
+            .ok_or_else(|| "Main window 'main' not found".to_string())?;
 
-    let webview_builder = WebviewBuilder::new(&panel_label, WebviewUrl::External(parsed_url))
-        .data_directory(data_dir)
-        .initialization_script(AUTO_ALLOW_AND_PERF_SCRIPT)
-        .auto_resize();
+        let parsed_url: url::Url = target_url
+            .parse()
+            .map_err(|e| format!("Invalid provider URL: {e}"))?;
 
-    main_window
-        .add_child(
-            webview_builder,
-            LogicalPosition::new(x, y),
-            LogicalSize::new(width, height),
-        )
-        .map_err(|e| format!("Failed to mount docked AI webview '{panel_label}': {e}"))?;
+        let webview_builder = WebviewBuilder::new(&panel_label, WebviewUrl::External(parsed_url))
+            .data_directory(data_dir)
+            .initialization_script(AUTO_ALLOW_AND_PERF_SCRIPT)
+            .auto_resize();
+
+        main_window
+            .add_child(
+                webview_builder,
+                LogicalPosition::new(x, y),
+                LogicalSize::new(width, height),
+            )
+            .map_err(|e| format!("Failed to mount docked AI webview '{panel_label}': {e}"))?;
+    }
+
+    // Only record the new active provider once the mount/show actually succeeded.
+    *active_guard = Some(norm_provider.clone());
 
     Ok(AiPanelStatus {
         provider: norm_provider,
@@ -299,8 +410,11 @@ fn detach_ai_panel(
             .active_docked_provider
             .lock()
             .map_err(|e| format!("Mutex lock error: {e}"))?;
+        // Keep the docked webview warm (hidden) so redock is instant and label reuse is collision-free.
         if let Some(existing_wv) = app.get_webview(&panel_label) {
-            let _ = existing_wv.close();
+            existing_wv
+                .hide()
+                .map_err(|e| format!("Failed to hide docked panel '{panel_label}': {e}"))?;
         }
         if active_guard.as_deref() == Some(norm_provider.as_str()) {
             *active_guard = None;
@@ -444,6 +558,16 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let Some(provider) = window.label().strip_prefix("ai_float_") {
+                if let tauri::WindowEvent::Destroyed = event {
+                    let state = window.state::<AppRuntimeState>();
+                    let removed = match state.detached_providers.lock() {
+                        Ok(mut g) => g.remove(provider).is_some(),
+                        Err(_) => false,
+                    };
+                    let _ = removed;
+                }
+            }
             if window.label() == "main" {
                 if let tauri::WindowEvent::Destroyed = event {
                     let state = window.state::<AppRuntimeState>();
@@ -467,4 +591,23 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running StudyApp tauri application");
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_paths_inside_sandbox() {
+        assert!(enforce_e_drive_sandbox(Path::new("vault/note.md")).is_ok());
+        assert!(enforce_e_drive_sandbox(Path::new(r"E:\StudyApp\MyFiles\srs_data\studyapp_srs.db")).is_ok());
+    }
+
+    #[test]
+    fn rejects_traversal_and_foreign_paths() {
+        assert!(enforce_e_drive_sandbox(Path::new("../secrets.txt")).is_err());
+        assert!(enforce_e_drive_sandbox(Path::new("vault/../../outside.md")).is_err());
+        assert!(enforce_e_drive_sandbox(Path::new(r"C:\Windows\win.ini")).is_err());
+        assert!(enforce_e_drive_sandbox(Path::new(r"E:\StudyApp\MyFiles_evil\x.md")).is_err());
+    }
 }

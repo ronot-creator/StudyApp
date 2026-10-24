@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS srs_cards (
     reps INTEGER NOT NULL DEFAULT 0,
     lapses INTEGER NOT NULL DEFAULT 0,
     state INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1, 2, 3)),
+    learning_step INTEGER NOT NULL DEFAULT 0,
     due_date TEXT NOT NULL DEFAULT (datetime('now')),
     last_review TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
