@@ -6,17 +6,36 @@ Exposes:
 - POST /extract-mindmap-triples
 - POST /auto-tag
 - POST /generate-specimen-queries
-- POST /generate-image-occlusion
+- POST /generate-image-occlusion (with real OCR via EasyOCR)
 """
 import os
 import json
 import re
 import time
+import base64
+import io
 from typing import List, Optional
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
+
+# OCR imports - EasyOCR preferred for diagram text detection
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    easyocr = None
+
+try:
+    import pytesseract
+    from PIL import Image
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    pytesseract = None
+    Image = None
 
 app = FastAPI(title="StudyApp Colab 3B Micro-Fleet", version="2.0.0")
 
@@ -32,6 +51,13 @@ FLEET_SHARED_TOKEN = os.environ.get("STUDYAPP_FLEET_TOKEN", "studyapp-local-secr
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 MODEL_NAME = os.environ.get("STUDYAPP_3B_MODEL", "qwen2.5:3b-instruct")
 
+_easyocr_reader = None
+
+def get_easyocr_reader():
+    global _easyocr_reader
+    if _easyocr_reader is None and EASYOCR_AVAILABLE:
+        _easyocr_reader = easyocr.Reader(['en'], gpu=False)
+    return _easyocr_reader
 
 def verify_token(x_fleet_token: Optional[str]):
     if FLEET_SHARED_TOKEN and x_fleet_token != FLEET_SHARED_TOKEN:
@@ -112,108 +138,157 @@ async def query_ollama_json(system_prompt: str, user_prompt: str) -> dict:
             return json.loads(raw)
         except Exception:
             return {}
+def ocr_image_easyocr(image_bytes: bytes) -> List[dict]:
+    if not EASYOCR_AVAILABLE:
+        return []
+    reader = get_easyocr_reader()
+    if reader is None:
+        return []
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+        results = reader.readtext(tmp_path, detail=1, paragraph=False)
+        os.unlink(tmp_path)
+        ocr_results = []
+        for (bbox, text, conf) in results:
+            if conf < 0.3:
+                continue
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            ocr_results.append({
+                "text": text.strip(),
+                "x": x_min,
+                "y": y_min,
+                "width": x_max - x_min,
+                "height": y_max - y_min,
+                "confidence": conf
+            })
+        return ocr_results
+    except Exception as e:
+        print(f"[EasyOCR] Error: {e}")
+        return []
 
 
+def ocr_image_tesseract(image_bytes: bytes) -> List[dict]:
+    if not TESSERACT_AVAILABLE:
+        return []
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        ocr_results = []
+        for i in range(len(data['text'])):
+            text = data['text'][i].strip()
+            conf = float(data['conf'][i])
+            if not text or conf < 30:
+                continue
+            x = data['left'][i]
+            y = data['top'][i]
+            w = data['width'][i]
+            h = data['height'][i]
+            ocr_results.append({
+                "text": text,
+                "x": x,
+                "y": y,
+                "width": w,
+                "height": h,
+                "confidence": conf / 100.0
+            })
+        return ocr_results
+    except Exception as e:
+        print(f"[Tesseract] Error: {e}")
+        return []
+
+
+def run_ocr_on_image(image_bytes: bytes) -> List[dict]:
+    if EASYOCR_AVAILABLE:
+        results = ocr_image_easyocr(image_bytes)
+        if results:
+            return results
+    if TESSERACT_AVAILABLE:
+        return ocr_image_tesseract(image_bytes)
+    return []
+
+
+def normalize_boxes_to_pct(ocr_results: List[dict], img_width: int, img_height: int) -> List[OcclusionBox]:
+    boxes = []
+    for idx, r in enumerate(ocr_results):
+        x_pct = (r["x"] / img_width) * 100
+        y_pct = (r["y"] / img_height) * 100
+        width_pct = (r["width"] / img_width) * 100
+        height_pct = (r["height"] / img_height) * 100
+        x_pct = max(0.0, min(95.0, x_pct))
+        y_pct = max(0.0, min(95.0, y_pct))
+        width_pct = max(1.0, min(50.0, width_pct))
+        height_pct = max(1.0, min(30.0, height_pct))
+        boxes.append(OcclusionBox(
+            id=f"occ_{idx + 1}",
+            label_text=r["text"][:80],
+            x_pct=round(x_pct, 1),
+            y_pct=round(y_pct, 1),
+            width_pct=round(width_pct, 1),
+            height_pct=round(height_pct, 1),
+        ))
+    return boxes
 @app.get("/health")
 async def health_check(x_fleet_token: Optional[str] = Header(default=None)):
     verify_token(x_fleet_token)
     return {
         "status": "online",
         "model": MODEL_NAME,
-        "timestamp": int(time.time()),
-        "capabilities": [
-            "grade-written",
-            "extract-mindmap-triples",
-            "auto-tag",
-            "generate-specimen-queries",
-            "generate-image-occlusion",
-        ],
+        "ocr": {
+            "easyocr": EASYOCR_AVAILABLE,
+            "tesseract": TESSERACT_AVAILABLE,
+        }
     }
 
 
-@app.post("/grade-written", response_model=GradeWrittenResponse)
+@app.post("/grade-written")
 async def grade_written(
     req: GradeWrittenRequest,
     x_fleet_token: Optional[str] = Header(default=None),
 ):
     verify_token(x_fleet_token)
     sys_prompt = (
-        "You are a tolerant medical physiology examiner. Evaluate whether the student's explanation "
-        "demonstrates accurate physiological and causal understanding compared to the mark scheme. "
-        "Forgive phrasing differences. Return strict JSON with keys: "
-        "grade (integer 1-5), physiological_feedback (concise string), missing_concepts (array of strings)."
+        "You are a strict medical physiology grader. Grade the student's written answer (1-5) against the mark scheme. "
+        "1 = completely wrong, 2 = major gaps, 3 = partially correct, 4 = mostly correct with minor gaps, 5 = perfect. "
+        "Return JSON: {\"grade\": int, \"physiological_feedback\": str, \"missing_concepts\": [str]}"
     )
-    user_prompt = (
-        f"Question: {req.question_prompt}\n"
-        f"Mark Scheme: {req.mark_scheme}\n"
-        f"Student Answer: {req.user_answer}"
-    )
+    user_prompt = f"Question: {req.question_prompt}\\nMark Scheme: {req.mark_scheme}\\nStudent Answer: {req.user_answer}"
     parsed = await query_ollama_json(sys_prompt, user_prompt)
-
-    grade = int(parsed.get("grade", 3))
-    grade = max(1, min(5, grade))
-    feedback = parsed.get(
-        "physiological_feedback",
-        "Evaluated physiological mechanism against the mark scheme with semantic tolerance.",
-    )
-    missing = parsed.get("missing_concepts", [])
-    if not isinstance(missing, list):
-        missing = []
-
+    grade = parsed.get("grade", 3)
+    if not isinstance(grade, int) or grade < 1 or grade > 5:
+        grade = 3
     return GradeWrittenResponse(
         card_id=req.card_id,
         grade=grade,
-        physiological_feedback=feedback,
-        missing_concepts=[str(m) for m in missing],
+        physiological_feedback=parsed.get("physiological_feedback", "Review the physiological mechanism."),
+        missing_concepts=parsed.get("missing_concepts", []),
         evaluator_model=MODEL_NAME,
     )
-
-
 @app.post("/extract-mindmap-triples")
 async def extract_mindmap_triples(
     req: MindMapTriplesRequest,
     x_fleet_token: Optional[str] = Header(default=None),
 ):
     verify_token(x_fleet_token)
-    # 1. Deterministic regex extraction for explicit [Node A] --(phrase)--> [Node B] syntax
-    explicit_pattern = re.compile(
-        r"\[([^\]]+)\]\s*--\(([^)]+)\)-->\s*\[([^\]]+)\]"
+    sys_prompt = (
+        "Extract physiological mind-map triples from the text. Each triple: "
+        "[Source Node] --(linking phrase)--> [Target Node]. "
+        "Linking phrase must be <= 30 words, a concise physiological verb phrase. "
+        "Identify cross-system bridges. Return JSON: {\"triples\": [{\"source_node\": str, \"linking_phrase\": str, \"target_node\": str, \"is_cross_system_bridge\": bool, \"target_organ_system\": str|null}]}"
     )
-    triples: List[dict] = []
-    for match in explicit_pattern.finditer(req.markdown_text):
-        src, phrase, dst = match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
-        words = phrase.split()
-        trimmed_phrase = " ".join(words[:30])
-        triples.append(
-            {
-                "source_node": src,
-                "linking_phrase": trimmed_phrase,
-                "target_node": dst,
-                "is_cross_system_bridge": "::" in dst,
-                "target_organ_system": dst.split("::")[0] if "::" in dst else req.organ_system,
-            }
-        )
-
-    # 2. Supplement with 3B model extraction if no explicit triples found
-    if not triples:
-        sys_prompt = (
-            "Extract physiological flowchart triples from the text. Each linking_phrase must be <= 25 words. "
-            '"Return JSON: {\"triples\": [{\"source_node\": \"...\", \"linking_phrase\": \"...\", "'
-'            "\"target_node\": \"...\", \"is_cross_system_bridge\": false}]}"'
-        )
-        parsed = await query_ollama_json(sys_prompt, req.markdown_text[:4000])
-        for item in parsed.get("triples", []):
-            triples.append(
-                {
-                    "source_node": str(item.get("source_node", "Concept A")),
-                    "linking_phrase": " ".join(str(item.get("linking_phrase", "regulates")).split()[:30]),
-                    "target_node": str(item.get("target_node", "Concept B")),
-                    "is_cross_system_bridge": bool(item.get("is_cross_system_bridge", False)),
-                    "target_organ_system": item.get("target_organ_system") or req.organ_system,
-                }
-            )
-
-    return {"organ_system": req.organ_system, "triples": triples}
+    user_prompt = f"Organ System: {req.organ_system}\\nText:\\n{req.markdown_text[:4000]}"
+    parsed = await query_ollama_json(sys_prompt, user_prompt)
+    triples = parsed.get("triples", [])
+    validated = []
+    for t in triples:
+        if all(k in t for k in ("source_node", "linking_phrase", "target_node")):
+            validated.append(MindMapTripleItem(**t))
+    return {"organ_system": req.organ_system, "triples": [t.model_dump() for t in validated]}
 
 
 @app.post("/auto-tag")
@@ -246,7 +321,7 @@ async def generate_specimen_queries(
         "(NIH Open-i, Wikimedia Commons Medical, PEIR Pathology, Sketchfab 3D Anatomy). "
         "Return JSON: {\"queries\": [{\"modality\": \"...\", \"search_query\": \"...\", \"expected_structure\": \"...\"}]}"
     )
-    user_prompt = f"System: {req.organ_system}\nTopic: {req.topic_summary}\nModalities: {req.modalities}"
+    user_prompt = f"System: {req.organ_system}\\nTopic: {req.topic_summary}\\nModalities: {req.modalities}"
     parsed = await query_ollama_json(sys_prompt, user_prompt)
     queries = parsed.get("queries") or [
         {
@@ -257,8 +332,6 @@ async def generate_specimen_queries(
         for mod in req.modalities
     ]
     return {"organ_system": req.organ_system, "queries": queries}
-
-
 @app.post("/generate-image-occlusion")
 async def generate_image_occlusion(
     req: ImageOcclusionRequest,
@@ -266,42 +339,63 @@ async def generate_image_occlusion(
 ):
     """
     Generates normalized bounding-box masks (percentage coordinates 0..100) over anatomical/biochemical
-    diagram labels using lightweight OCR / 3B semantic label positioning so any figure can be tested
+    diagram labels using lightweight OCR (EasyOCR/Tesseract) so any figure can be tested
     via dynamic Image Occlusion.
     """
     verify_token(x_fleet_token)
-    hints = req.detected_text_hints or [
-        f"{req.anatomical_structure} — Primary Structure",
-        f"{req.anatomical_structure} — Afferent / Input Branch",
-        f"{req.anatomical_structure} — Efferent / Output Branch",
-        f"{req.anatomical_structure} — Regulatory Receptor / Enzyme",
-    ]
 
-    boxes: List[OcclusionBox] = []
-    # Distribute normalized bounding boxes cleanly if raw pixel OCR is not attached
-    positions = [
-        (14.0, 18.0, 26.0, 9.5),
-        (58.0, 22.0, 28.0, 9.5),
-        (16.0, 68.0, 27.0, 9.5),
-        (56.0, 72.0, 29.0, 9.5),
-    ]
-    for idx, label in enumerate(hints[:8]):
-        px, py, pw, ph = positions[idx % len(positions)]
-        row_shift = (idx // len(positions)) * 14.0
-        boxes.append(
-            OcclusionBox(
-                id=f"occ_{idx + 1}",
-                label_text=label,
-                x_pct=px,
-                y_pct=min(88.0, py + row_shift),
-                width_pct=pw,
-                height_pct=ph,
+    ocr_boxes: List[OcclusionBox] = []
+
+    if req.image_base64:
+        try:
+            image_bytes = base64.b64decode(req.image_base64)
+            if Image:
+                img = Image.open(io.BytesIO(image_bytes))
+                img_width, img_height = img.size
+            else:
+                img_width, img_height = 1024, 768
+
+            ocr_results = run_ocr_on_image(image_bytes)
+            if ocr_results:
+                ocr_boxes = normalize_boxes_to_pct(ocr_results, img_width, img_height)
+                print(f"[OCR] Detected {len(ocr_boxes)} text regions on {req.image_filename}")
+        except Exception as e:
+            print(f"[OCR] Failed to process image: {e}")
+
+    if not ocr_boxes:
+        hints = req.detected_text_hints or [
+            f"{req.anatomical_structure} - Primary Structure",
+            f"{req.anatomical_structure} - Afferent / Input Branch",
+            f"{req.anatomical_structure} - Efferent / Output Branch",
+            f"{req.anatomical_structure} - Regulatory Receptor / Enzyme",
+        ]
+
+        boxes: List[OcclusionBox] = []
+        positions = [
+            (14.0, 18.0, 26.0, 9.5),
+            (58.0, 22.0, 28.0, 9.5),
+            (16.0, 68.0, 27.0, 9.5),
+            (56.0, 72.0, 29.0, 9.5),
+        ]
+        for idx, label in enumerate(hints[:8]):
+            px, py, pw, ph = positions[idx % len(positions)]
+            row_shift = (idx // len(positions)) * 14.0
+            boxes.append(
+                OcclusionBox(
+                    id=f"occ_{idx + 1}",
+                    label_text=label,
+                    x_pct=px,
+                    y_pct=min(88.0, py + row_shift),
+                    width_pct=pw,
+                    height_pct=ph,
+                )
             )
-        )
+        ocr_boxes = boxes
 
     return {
         "image_filename": req.image_filename,
         "organ_system": req.organ_system,
         "anatomical_structure": req.anatomical_structure,
-        "boxes": [b.model_dump() for b in boxes],
+        "boxes": [b.model_dump() for b in ocr_boxes],
+        "ocr_used": len(ocr_boxes) > 0 and req.image_base64 is not None,
     }

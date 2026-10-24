@@ -1,6 +1,19 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import { createRequire } from "node:module";
-import { NgrokGrader, GraderRejectedError, type DbLike, type QueueRow } from "../src/services/ngrokGrader";
+
+// Mock localStorage before importing the module
+const mockLocalStorage = {
+  getItem: vi.fn(() => null),
+  setItem: vi.fn(),
+  removeItem: vi.fn(),
+  clear: vi.fn(),
+};
+Object.defineProperty(globalThis, "localStorage", {
+  value: mockLocalStorage,
+  writable: true,
+});
+
+import { NgrokGraderService, GraderRejectedError, type DbLike, type QueueRow } from "../src/services/ngrokGrader";
 
 // Vite 5 cannot resolve the `node:sqlite` builtin through import; load it via require.
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
@@ -49,13 +62,13 @@ describe("NgrokGrader", () => {
     state = { mode: "online", calls: [] };
     db = makeDb();
     graded = [];
-    grader = new NgrokGrader({
+    grader = new NgrokGraderService({
       db,
       fetchFn: makeFetch(state),
       storage: mem(),
       onReplayGraded: (row, res) => void graded.push([row, res.grade]),
     });
-    grader.setTunnel("https://abc.ngrok-free.app/", "tok");
+    grader.setTunnelConfig("https://abc.ngrok-free.app/", "tok");
   });
 
   it("grades online and maps snake_case to camelCase", async () => {
