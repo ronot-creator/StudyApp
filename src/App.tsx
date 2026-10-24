@@ -268,6 +268,16 @@ export default function App() {
                 </div>
               </div>
 
+              {isSourcing && (
+                <div className="liquid-card" style={{ minHeight: "120px" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "12px", alignItems: "center", justifyContent: "center", padding: "24px" }}>
+                    <div className="liquid-skeleton" style={{ width: "60%", height: "16px", borderRadius: "8px" }} />
+                    <div className="liquid-skeleton" style={{ width: "40%", height: "12px", borderRadius: "6px" }} />
+                    <div className="liquid-skeleton" style={{ width: "80%", height: "120px", borderRadius: "12px", background: "linear-gradient(90deg, rgba(15,23,42,0.6) 25%, rgba(30,41,59,0.6) 50%, rgba(15,23,42,0.6) 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.5s infinite" }} />
+                  </div>
+                </div>
+              )}
+
               {sourcedAssets.length > 0 && (
                 <div className="liquid-card">
                   <h4 style={{ margin: "0 0 10px 0", fontSize: "13.5px" }}>
@@ -286,6 +296,20 @@ export default function App() {
                         }}
                       >
                         <strong>{a.descriptiveFilename}</strong> ({a.organSystem} — {a.modality})
+                        {a.sourceUrl && (
+                          <img
+                            src={a.sourceUrl}
+                            alt={a.descriptiveFilename}
+                            style={{
+                              maxWidth: "100%",
+                              maxHeight: "180px",
+                              marginTop: "8px",
+                              borderRadius: "8px",
+                              border: "1px solid rgba(255,255,255,0.1)",
+                              background: "rgba(0,0,0,0.3)",
+                            }}
+                          />
+                        )}
                         <div style={{ color: "#94a3b8", marginTop: "4px" }}>
                           Credit: {a.sourceCredit} | Occlusion Masks: {a.occlusionBoxes.length}
                         </div>

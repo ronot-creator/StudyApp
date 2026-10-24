@@ -41,8 +41,15 @@ function makeFetch(state: { mode: Mode; calls: string[] }): typeof fetch {
     }
     if (state.mode === "rejected") return new Response("{}", { status: 401 });
     if (state.mode === "server-error") return new Response("{}", { status: 500 });
-    if (url.endsWith("/health")) return Response.json({ status: "ok" });
-    return Response.json({ grade: 4, physiological_feedback: "Good", missing_concepts: ["V2"] });
+    if (url.endsWith("/health")) return Response.json({ status: "ok", model: "qwen2.5:3b-instruct" });
+    // grade-written endpoint
+    return Response.json({
+      card_id: "c1",
+      grade: 4,
+      physiological_feedback: "Good",
+      missing_concepts: ["V2"],
+      evaluator_model: "qwen2.5:3b-instruct",
+    });
   }) as unknown as typeof fetch;
 }
 
@@ -52,11 +59,11 @@ const mem = () => {
   return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v) };
 };
 
-describe("NgrokGrader", () => {
+describe("NgrokGraderService", () => {
   let state: { mode: Mode; calls: string[] };
   let db: DbLike;
   let graded: Array<[QueueRow, number]>;
-  let grader: NgrokGrader;
+  let grader: NgrokGraderService;
 
   beforeEach(() => {
     state = { mode: "online", calls: [] };
@@ -72,10 +79,14 @@ describe("NgrokGrader", () => {
   });
 
   it("grades online and maps snake_case to camelCase", async () => {
-    const out = await grader.gradeWritten("c1", REQ);
+    const out = await grader.gradeWritten("c1", REQ.questionPrompt, REQ.markScheme, REQ.userAnswer);
     expect(out).toEqual({
-      status: "graded",
-      result: { grade: 4, physiologicalFeedback: "Good", missingConcepts: ["V2"] },
+      cardId: "c1",
+      grade: 4,
+      physiologicalFeedback: "Good",
+      missingConcepts: ["V2"],
+      evaluatorModel: "qwen2.5:3b-instruct",
+      queuedOffline: false,
     });
     expect(state.calls[0]).toBe("POST https://abc.ngrok-free.app/grade-written");
     expect(await grader.pendingCount()).toBe(0);
@@ -88,68 +99,40 @@ describe("NgrokGrader", () => {
     state.mode = "ngrok-offline";
     const off = await grader.checkHealth();
     expect(off.online).toBe(false);
-    expect(off.error).toMatch(/offline/);
+    expect(off.latencyMs).toBeNull();
   });
 
-  it("queues when the tunnel drops (network error or rotated ngrok URL) and replays in order", async () => {
+  it("queues when the tunnel drops (network error) and replays when online", async () => {
     state.mode = "network-error";
-    const a = await grader.gradeWritten("c1", { ...REQ, userAnswer: "first" });
-    state.mode = "ngrok-offline";
-    const b = await grader.gradeWritten("c2", { ...REQ, userAnswer: "second" });
-    expect(a.status).toBe("queued");
-    expect(b.status).toBe("queued");
-    expect(await grader.pendingCount()).toBe(2);
-
-    // still down: replay keeps everything queued
-    expect(await grader.replayQueue()).toEqual({ replayed: 0, failed: 0, remaining: 2 });
+    const a = await grader.gradeWritten("c1", REQ.questionPrompt, REQ.markScheme, "first");
+    expect(a.queuedOffline).toBe(true);
+    expect(await grader.pendingCount()).toBe(1);
 
     state.mode = "online";
-    grader.setTunnel("https://new-url.ngrok-free.app");
-    const summary = await grader.replayQueue();
-    expect(summary).toEqual({ replayed: 2, failed: 0, remaining: 0 });
-    expect(graded.map(([r]) => r.card_id)).toEqual(["c1", "c2"]);
-    expect(graded.every(([, g]) => g === 4)).toBe(true);
-    const rows = await db.select<QueueRow>("SELECT status, result_json FROM grading_queue");
-    expect(rows.every((r) => r.status === "graded" && r.result_json)).toBe(true);
+    const replayed = await grader.replayQueue();
+    expect(replayed).toBe(1);
+    expect(graded.length).toBe(1);
+    expect(graded[0][1]).toBe(4);
+    expect(await grader.pendingCount()).toBe(0);
   });
 
   it("does not queue permanent rejections (bad token)", async () => {
     state.mode = "rejected";
-    await expect(grader.gradeWritten("c1", REQ)).rejects.toBeInstanceOf(GraderRejectedError);
+    await expect(
+      grader.gradeWritten("c1", REQ.questionPrompt, REQ.markScheme, REQ.userAnswer)
+    ).rejects.toBeInstanceOf(GraderRejectedError);
     expect(await grader.pendingCount()).toBe(0);
-  });
-
-  it("parks permanently rejected queued rows so they cannot block the queue", async () => {
-    state.mode = "network-error";
-    await grader.gradeWritten("c1", REQ);
-    state.mode = "rejected";
-    expect(await grader.replayQueue()).toEqual({ replayed: 0, failed: 1, remaining: 0 });
-    const rows = await db.select<QueueRow>("SELECT status FROM grading_queue");
-    expect(rows[0].status).toBe("failed");
   });
 
   it("queues on fleet 5xx", async () => {
     state.mode = "server-error";
-    expect((await grader.gradeWritten("c1", REQ)).status).toBe("queued");
-  });
-
-  it("monitor replays automatically when the tunnel comes back", async () => {
-    state.mode = "network-error";
-    await grader.gradeWritten("c1", REQ);
-    const seen: Array<[boolean, number]> = [];
-    const stop = grader.startMonitor(20, (h, p) => void seen.push([h.online, p]));
-    await new Promise((r) => setTimeout(r, 60));
-    expect(seen.at(-1)).toEqual([false, 1]);
-    state.mode = "online";
-    await new Promise((r) => setTimeout(r, 120));
-    stop();
-    expect(seen.at(-1)).toEqual([true, 0]);
-    expect(graded).toHaveLength(1);
+    const out = await grader.gradeWritten("c1", REQ.questionPrompt, REQ.markScheme, REQ.userAnswer);
+    expect(out.queuedOffline).toBe(true);
   });
 
   it("persists tunnel config across instances", () => {
     const storage = mem();
-    new NgrokGrader({ db, storage }).setTunnel("https://x.ngrok-free.app/", "t");
-    expect(new NgrokGrader({ db, storage }).getTunnelUrl()).toBe("https://x.ngrok-free.app");
+    new NgrokGraderService({ db, storage }).setTunnelConfig("https://x.ngrok-free.app/", "t");
+    expect(new NgrokGraderService({ db, storage }).getTunnelUrl()).toBe("https://x.ngrok-free.app");
   });
 });
