@@ -1,59 +1,75 @@
-import { useEffect, useState } from "react";
-import { getNgrokGrader, type TunnelHealth } from "../services/ngrokGrader";
+import React, { useEffect, useState } from "react";
+import { getNgrokGrader } from "../services/ngrokGrader";
 
-const HEALTH_POLL_MS = 15_000;
+export const TunnelStatus: React.FC = () => {
+  const grader = getNgrokGrader();
+  const [url, setUrl] = useState<string>(grader.getTunnelUrl());
+  const [online, setOnline] = useState<boolean>(false);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [editing, setEditing] = useState<boolean>(false);
 
-/** Tunnel URL / token inputs + live latency badge + offline-queue counter. */
-export default function TunnelStatus() {
-  const [url, setUrl] = useState("");
-  const [token, setToken] = useState("");
-  const [health, setHealth] = useState<TunnelHealth | null>(null);
-  const [pending, setPending] = useState(0);
-  const [error, setError] = useState("");
-  const [applied, setApplied] = useState(0); // bump to restart the monitor after URL changes
-
-  useEffect(() => {
-    let stop = () => {};
-    let cancelled = false;
-    getNgrokGrader()
-      .then((grader) => {
-        if (cancelled) return;
-        if (!url && grader.getTunnelUrl()) setUrl(grader.getTunnelUrl());
-        stop = grader.startMonitor(HEALTH_POLL_MS, (h, p) => {
-          setHealth(h);
-          setPending(p);
-        });
-      })
-      .catch((e) => setError(String(e)));
-    return () => {
-      cancelled = true;
-      stop();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applied]);
-
-  const apply = async () => {
-    const grader = await getNgrokGrader();
-    grader.setTunnel(url, token || undefined);
-    setApplied((n) => n + 1);
+  const pollHealth = async () => {
+    const status = await grader.checkHealth();
+    setOnline(status.online);
+    setLatencyMs(status.latencyMs);
   };
 
-  const color = !health ? "#64748b" : health.online ? "#22c55e" : "#ef4444";
-  const label = !health
-    ? "checking..."
-    : health.online
-      ? `online · ${health.latencyMs} ms`
-      : `offline${pending ? ` · ${pending} answer(s) queued` : ""}`;
-  const input = { width: "100%", padding: "6px", borderRadius: "4px", border: "1px solid #334155", background: "#1e293b", color: "#fff", marginBottom: "4px" } as const;
+  useEffect(() => {
+    void pollHealth();
+    const timer = setInterval(() => {
+      void pollHealth();
+    }, 15000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const saveUrl = () => {
+    grader.setTunnelConfig(url);
+    setEditing(false);
+    void pollHealth();
+  };
 
   return (
-    <div>
-      <label style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}>Colab 3B Ngrok Tunnel URL</label>
-      <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxx.ngrok-free.app" style={input} />
-      <input value={token} onChange={(e) => setToken(e.target.value)} type="password" placeholder="Fleet token (X-Fleet-Token)" style={input} />
-      <button onClick={apply} style={{ padding: "4px 10px", marginBottom: "6px" }}>Connect</button>
-      <div style={{ fontSize: "12px", color }}>● {label}</div>
-      {error && <div style={{ fontSize: "11px", color: "#f87171" }}>{error}</div>}
+    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+      <span
+        className="liquid-badge"
+        style={{
+          background: online ? "rgba(52, 211, 153, 0.16)" : "rgba(251, 191, 36, 0.16)",
+          color: online ? "#34d399" : "#fbbf24",
+          border: online
+            ? "1px solid rgba(52, 211, 153, 0.4)"
+            : "1px solid rgba(251, 191, 36, 0.4)",
+          cursor: "pointer",
+        }}
+        onClick={() => setEditing(!editing)}
+        title="Click to configure Colab 3B Ngrok Tunnel URL"
+      >
+        <span
+          style={{
+            width: "7px",
+            height: "7px",
+            borderRadius: "50%",
+            background: online ? "#34d399" : "#fbbf24",
+          }}
+        />
+        {online
+          ? `Colab 3B Online (${latencyMs ?? "--"} ms)`
+          : "Colab 3B Offline (SQLite Queue Active)"}
+      </span>
+
+      {editing && (
+        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          <input
+            className="liquid-input"
+            style={{ width: "240px", padding: "5px 9px", fontSize: "12px" }}
+            placeholder="https://xxxx.ngrok-free.app"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+          />
+          <button className="liquid-btn" style={{ padding: "5px 10px" }} onClick={saveUrl}>
+            Save
+          </button>
+        </div>
+      )}
     </div>
   );
-}
+};

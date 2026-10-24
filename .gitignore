@@ -40,6 +40,3 @@ MyFiles/.webview_partitions/
 *.log
 .DS_Store
 Thumbs.db
-
-# Test caches
-.pytest_cache/
