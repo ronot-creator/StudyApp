@@ -5,23 +5,42 @@ export const SQLITE_DB_URI = "sqlite:E:/StudyApp/MyFiles/srs_data/studyapp_srs.d
 
 export type ReplayGradedCallback = (result: ColabGradeResponse) => void;
 
+export interface NgrokGraderOptions {
+  /** Optional fetch implementation for testing (defaults to global fetch). */
+  fetchFn?: typeof fetch;
+  /** Optional storage implementation (defaults to localStorage). */
+  storage?: Storage;
+}
+
 export class NgrokGraderService {
-  private tunnelUrl: string = localStorage.getItem("studyapp_ngrok_url") || "";
-  private fleetToken: string = localStorage.getItem("studyapp_fleet_token") || "studyapp-local-secret";
+  private fetchFn: typeof fetch;
+  private storage: Storage;
   private isOnline: boolean = false;
   private lastLatencyMs: number | null = null;
   private replayListeners: Set<ReplayGradedCallback> = new Set();
+
+  constructor(options: NgrokGraderOptions = {}) {
+    this.fetchFn = options.fetchFn ?? fetch;
+    this.storage = options.storage ?? localStorage;
+  }
+
+  private get tunnelUrl(): string {
+    return this.storage.getItem("studyapp_ngrok_url") || "";
+  }
+
+  private get fleetToken(): string {
+    return this.storage.getItem("studyapp_fleet_token") || "studyapp-local-secret";
+  }
 
   public getTunnelUrl(): string {
     return this.tunnelUrl;
   }
 
   public setTunnelConfig(url: string, token?: string): void {
-    this.tunnelUrl = url.trim().replace(/\/+$/, "");
-    localStorage.setItem("studyapp_ngrok_url", this.tunnelUrl);
+    const cleaned = url.trim().replace(/\\/+$/, "");
+    this.storage.setItem("studyapp_ngrok_url", cleaned);
     if (token !== undefined) {
-      this.fleetToken = token.trim();
-      localStorage.setItem("studyapp_fleet_token", this.fleetToken);
+      this.storage.setItem("studyapp_fleet_token", token.trim());
     }
   }
 
@@ -31,14 +50,15 @@ export class NgrokGraderService {
   }
 
   public async checkHealth(): Promise<{ online: boolean; latencyMs: number | null; model?: string }> {
-    if (!this.tunnelUrl) {
+    const url = this.tunnelUrl;
+    if (!url) {
       this.isOnline = false;
       this.lastLatencyMs = null;
       return { online: false, latencyMs: null };
     }
     const start = performance.now();
     try {
-      const resp = await fetch(`${this.tunnelUrl}/health`, {
+      const resp = await this.fetchFn(`${url}/health`, {
         method: "GET",
         headers: {
           "X-Fleet-Token": this.fleetToken,
@@ -67,9 +87,10 @@ export class NgrokGraderService {
     markScheme: string,
     userAnswer: string
   ): Promise<ColabGradeResponse> {
-    if (this.tunnelUrl && this.isOnline) {
+    const url = this.tunnelUrl;
+    if (url && this.isOnline) {
       try {
-        const resp = await fetch(`${this.tunnelUrl}/grade-written`, {
+        const resp = await this.fetchFn(`${url}/grade-written`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -97,35 +118,9 @@ export class NgrokGraderService {
         this.isOnline = false;
       }
     }
-
-    // Queue in local SQLite grading_queue for automatic oldest-first replay on reconnect
-    try {
-      const db = await Database.load(SQLITE_DB_URI);
-      const queueId = `gq_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      await db.execute(
-        `INSERT INTO grading_queue (id, card_id, question_prompt, mark_scheme, user_answer, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending')`,
-        [queueId, cardId, questionPrompt, markScheme, userAnswer]
-      );
-    } catch {
-      // Fallback to localStorage queue when running in browser preview mode
-      const cached = JSON.parse(localStorage.getItem("studyapp_offline_grading_queue") || "[]");
-      cached.push({ cardId, questionPrompt, markScheme, userAnswer, queuedAt: new Date().toISOString() });
-      localStorage.setItem("studyapp_offline_grading_queue", JSON.stringify(cached));
-    }
-
-    return {
-      cardId,
-      grade: 3,
-      physiologicalFeedback: "Queued in Local SQLite (Auto-Replays on Reconnect)",
-      missingConcepts: [],
-      evaluatorModel: "OFFLINE_SQLITE_QUEUE",
-      queuedOffline: true,
-    };
-  }
-
-  public async replayQueue(): Promise<number> {
-    if (!this.tunnelUrl || !this.isOnline) return 0;
+public async replayQueue(): Promise<number> {
+    const url = this.tunnelUrl;
+    if (!url || !this.isOnline) return 0;
     let replayedCount = 0;
 
     try {
@@ -140,9 +135,9 @@ export class NgrokGraderService {
         }>
       >(
         `SELECT id, card_id, question_prompt, mark_scheme, user_answer
-         FROM grading_queue
-         WHERE status = 'pending'
-         ORDER BY queued_at ASC`
+           FROM grading_queue
+           WHERE status = 'pending'
+           ORDER BY queued_at ASC`
       );
 
       for (const row of pendingRows) {
@@ -171,9 +166,10 @@ export class NgrokGraderService {
     anatomicalStructure: string,
     hints?: string[]
   ): Promise<OcclusionBox[]> {
-    if (this.tunnelUrl && this.isOnline) {
+    const url = this.tunnelUrl;
+    if (url && this.isOnline) {
       try {
-        const resp = await fetch(`${this.tunnelUrl}/generate-image-occlusion`, {
+        const resp = await this.fetchFn(`${url}/generate-image-occlusion`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -232,3 +228,43 @@ export function getNgrokGrader(): NgrokGraderService {
   }
   return _graderInstance;
 }
+
+    // Queue in local SQLite grading_queue for automatic oldest-first replay on reconnect
+    try {
+      const db = await Database.load(SQLITE_DB_URI);
+      const queueId = `gq_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      await db.execute(
+        `INSERT INTO grading_queue (id, card_id, question_prompt, mark_scheme, user_answer, status)
+           VALUES ($1, $2, $3, $4, $5, 'pending')`,
+        [queueId, cardId, questionPrompt, markScheme, userAnswer]
+      );
+    } catch {
+      // Fallback to localStorage queue when running in browser preview mode
+      const cached = JSON.parse(this.storage.getItem("studyapp_offline_grading_queue") || "[]");
+      cached.push({ cardId, questionPrompt, markScheme, userAnswer, queuedAt: new Date().toISOString() });
+      this.storage.setItem("studyapp_offline_grading_queue", JSON.stringify(cached));
+    }
+
+    return {
+      cardId,
+      grade: 3,
+      physiologicalFeedback: "Queued in Local SQLite (Auto-Replays on Reconnect)",
+      missingConcepts: [],
+      evaluatorModel: "OFFLINE_SQLITE_QUEUE",
+      queuedOffline: true,
+    };
+  }
+
+  /** Returns the number of pending items in the offline grading queue. */
+  public async pendingCount(): Promise<number> {
+    try {
+      const db = await Database.load(SQLITE_DB_URI);
+      const rows = await db.select<{ cnt: number }[]>(
+        `SELECT COUNT(*) as cnt FROM grading_queue WHERE status = 'pending'`
+      );
+      return rows[0]?.cnt ?? 0;
+    } catch {
+      const cached = JSON.parse(this.storage.getItem("studyapp_offline_grading_queue") || "[]");
+      return cached.length;
+    }
+  }
