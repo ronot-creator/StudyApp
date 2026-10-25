@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import "./index.css";
 import "./styles/liquid-glass.css";
 import { AiProviderId, CANONICAL_ORGAN_SYSTEMS, OrganSystem } from "./types/study";
 import { TunnelStatus } from "./components/TunnelStatus";
@@ -160,6 +161,7 @@ export default function App() {
 
   return (
     <div className="liquid-shell">
+      <div className="liquid-aurora-backdrop" aria-hidden="true" />
       {dbToast && (
         <div
           role="alert"
@@ -287,6 +289,7 @@ export default function App() {
                     {sourcedAssets.map((a) => (
                       <div
                         key={a.id}
+                        className="liquid-interactive-tile"
                         style={{
                           padding: "10px 12px",
                           borderRadius: "10px",
@@ -327,6 +330,7 @@ export default function App() {
                   {DEFAULT_CURATED_REPOSITORIES.map((repo) => (
                     <div
                       key={repo.id}
+                      className="liquid-interactive-tile"
                       style={{
                         padding: "10px 12px",
                         borderRadius: "10px",

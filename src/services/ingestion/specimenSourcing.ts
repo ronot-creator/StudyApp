@@ -258,8 +258,8 @@ export class SpecimenSourcingService {
       try {
         await mkdir(IMAGES_REL_DIR, { baseDir: BaseDirectory.AppData, recursive: true });
         if (ext === "png") {
-          const pngBuffer = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
-          await writeFile(localPath, new Uint8Array(pngBuffer), { baseDir: BaseDirectory.AppData });
+          const pngBytes = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+          await writeFile(localPath, pngBytes, { baseDir: BaseDirectory.AppData });
         }
       } catch {
         // Ignore placeholder creation failure

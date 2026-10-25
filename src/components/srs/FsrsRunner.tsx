@@ -272,6 +272,7 @@ export const FsrsRunner: React.FC = () => {
               return (
                 <button
                   key={idx}
+                  className="liquid-interactive-tile"
                   onClick={() => handleMcqSelect(idx)}
                   disabled={selectedMcqIdx !== null}
                   style={{
