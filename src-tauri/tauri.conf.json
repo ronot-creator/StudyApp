@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "StudyApp — Local-First Medical AI Pipeline",
+        "title": "StudyApp \u2014 Local-First Medical AI Pipeline",
         "width": 1600,
         "height": 960,
         "resizable": true,
@@ -23,6 +23,9 @@
     ],
     "security": {
       "csp": null,
+      "capabilities": [
+        "default"
+      ],
       "assetProtocol": {
         "enable": true,
         "scope": [

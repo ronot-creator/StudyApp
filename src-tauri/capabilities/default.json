@@ -15,27 +15,55 @@
   ],
   "permissions": [
     "core:default",
+    "core:window:default",
+    "core:window:create",
+    "core:window:allow-create",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:window:allow-show",
+    "core:window:allow-hide",
     "core:webview:default",
+    "core:webview:create",
     "core:webview:allow-create-webview",
     "core:webview:allow-create-webview-window",
     "core:webview:allow-set-webview-position",
     "core:webview:allow-set-webview-size",
     "core:webview:allow-webview-close",
-    "core:window:default",
-    "core:window:allow-close",
-    "core:window:allow-set-focus",
+    "core:webview:allow-webview-show",
+    "core:webview:allow-webview-hide",
+    "switch_active_ai_panel",
+    "detach_ai_panel",
+    "redock_ai_panel",
+    "resize_docked_ai_panel",
+    "mount_persistent_ai_panel",
+    "update_active_highlight",
     "shell:allow-open",
     "shell:allow-execute",
     "sql:default",
     "sql:allow-execute",
     "sql:allow-select",
+    "fs:default",
+    "fs:allow-read-text-file",
+    "fs:allow-write-text-file",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-mkdir",
+    "fs:allow-exists",
     {
       "identifier": "fs:scope",
       "allow": [
-        { "path": "E:/StudyApp/MyFiles" },
-        { "path": "E:/StudyApp/MyFiles/**" },
-        { "path": "E:\\StudyApp\\MyFiles" },
-        { "path": "E:\\StudyApp\\MyFiles\\**" }
+        {
+          "path": "E:/StudyApp/MyFiles"
+        },
+        {
+          "path": "E:/StudyApp/MyFiles/**"
+        },
+        {
+          "path": "E:\\StudyApp\\MyFiles"
+        },
+        {
+          "path": "E:\\StudyApp\\MyFiles\\**"
+        }
       ]
     }
   ]

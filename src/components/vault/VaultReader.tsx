@@ -10,34 +10,38 @@ export interface VaultNoteFile {
   content: string;
 }
 
-const DEFAULT_VAULT_NOTES: VaultNoteFile[] = [
+export const DEFAULT_VAULT_NOTES: VaultNoteFile[] = [
   {
-    filename: "vault/renal_glomerular_hemodynamics.md",
+    filename: "vault/Renal.md",
     organSystem: "Renal",
     content: `# Glomerular Filtration & Tubuloglomerular Feedback (TGF)
 
 The renal corpuscle regulates glomerular filtration rate (GFR) across a wide range of systemic arterial pressures (80–180 mmHg) via myogenic autoregulation and tubuloglomerular feedback.
 
+\`\`\`mindmap
 [Macula Densa NaCl Delivery] --(triggers adenosine A1 receptor vasoconstriction of)--> [Afferent Arteriole]
-
+[Afferent Arteriole] --(lowers hydrostatic pressure inside)--> [Glomerular Capillaries]
+[Juxtaglomerular Granular Cells] --(secrete renin in response to beta-1 and low NaCl to generate)--> [Angiotensin II]
 [Angiotensin II] --(preferentially constricts AT1 receptors on)--> [Efferent Arteriole]
-
-[Renin-Angiotensin-Aldosterone Activation] --(increases systemic vascular resistance and venous return in)--> [Cardiovascular::Left Ventricular Preload]
+[Angiotensin II] --(increases systemic arterial afterload and venous return in)--> [Cardiovascular::Left Ventricular Preload]
+\`\`\`
 
 <!-- thought-anchor:ta_renal_01 -->
 > **[AI Margin Note #ta_renal_01]:** In bilateral renal artery stenosis, glomerular hydrostatic pressure is critically dependent on Angiotensin II-mediated efferent arteriolar tone. Starting an ACE inhibitor removes this constriction and causes an acute rise in serum creatinine.
 <!-- /thought-anchor:ta_renal_01 -->`,
   },
   {
-    filename: "vault/cardio_frank_starling_coupling.md",
+    filename: "vault/Cardiovascular.md",
     organSystem: "Cardiovascular",
     content: `# Ventricular-Vascular Coupling & Frank-Starling Law
 
 Sarcomere length-tension dependence increases stroke volume in response to elevated end-diastolic volume via heightened troponin C calcium sensitivity.
 
+\`\`\`mindmap
 [Left Ventricular End-Diastolic Volume] --(stretches sarcomeres to increase Ca2+ sensitivity and)--> [Stroke Volume]
-
-[Sympathetic Beta-1 Stimulation] --(accelerates SERCA2a phospholamban phosphorylation in)--> [Lusitropic Relaxation]`,
+[Sympathetic Beta-1 Stimulation] --(accelerates SERCA2a phospholamban phosphorylation in)--> [Lusitropic Relaxation]
+[Stroke Volume] --(augments mean arterial perfusion pressure delivered to)--> [Renal::Renal Artery Perfusion]
+\`\`\``,
   },
 ];
 
@@ -133,7 +137,7 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
 
   // Parse inline thought anchors for visual margin-note cards
   const anchorRegex =
-    /<!-- thought-anchor:([^\s]+) -->\s*> \*\*\[AI Margin Note #[^\]]+\]:\*\* ([\s\S]*?)\s*<!-- \/thought-anchor: -->/g;
+    /<!-- thought-anchor:([^\s]+) -->\s*> \*\*\[AI Margin Note #[^\]]+\]:\*\* ([\s\S]*?)\s*<!-- \/thought-anchor:\1 -->/g;
   const extractedAnchors: Array<{ id: string; text: string }> = [];
   let match: RegExpExecArray | null;
   while ((match = anchorRegex.exec(activeNote.content)) !== null) {

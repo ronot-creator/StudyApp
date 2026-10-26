@@ -25,6 +25,7 @@ const AI_PROVIDERS: Array<{ id: AiProviderId; label: string }> = [
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("vault");
+  const [mindMapSystem, setMindMapSystem] = useState<OrganSystem>("Renal");
   const [activeAiProvider, setActiveAiProvider] = useState<AiProviderId>("gemini");
   const [detachedProviders, setDetachedProviders] = useState<Record<string, boolean>>({});
   const [aiPanelStatusText, setAiPanelStatusText] = useState<string>(
@@ -216,14 +217,22 @@ export default function App() {
         <section className="liquid-left-pane" style={{ width: `${leftWidthPct}%` }}>
           {activeTab === "vault" && (
             <VaultReader
-              onPromoteToMindMapNode={() => setActiveTab("mindmap")}
+              onPromoteToMindMapNode={(sys) => {
+                setMindMapSystem(sys);
+                setActiveTab("mindmap");
+              }}
               onCreateFsrsCardFromHighlight={() => setActiveTab("srs")}
             />
           )}
 
           {activeTab === "srs" && <FsrsRunner />}
 
-          {activeTab === "mindmap" && <MindMapCanvas />}
+          {activeTab === "mindmap" && (
+            <MindMapCanvas
+              organSystem={mindMapSystem}
+              onOrganSystemChange={setMindMapSystem}
+            />
+          )}
 
           {activeTab === "specimens" && (
             <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
