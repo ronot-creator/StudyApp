@@ -326,6 +326,8 @@ export async function persistFsrsReview(
     ]
   );
 
+  const cached = getLocalCachedCards().map((c) => (c.id === u.id ? u : c));
+  saveLocalCachedCards(cached);
   return outcome;
 }
 
@@ -357,7 +359,14 @@ interface CardRow {
 
 /** Loads cards where `due_date <= now` OR `state IN (0, 1)` from the E:\ SQLite DB. Throws on failure. */
 export async function loadDueCards(limit = 200, now: Date = new Date()): Promise<SrsCard[]> {
-  const db = await Database.load(SQLITE_DB_URI);
+  try {
+    const db = await Database.load(SQLITE_DB_URI);
+    const existingCount = await db.select<Array<{ cnt: number }>>(`SELECT COUNT(*) AS cnt FROM srs_cards`);
+    if ((existingCount[0]?.cnt ?? 0) === 0) {
+      for (const seed of DEFAULT_SEED_CARDS) {
+        await createSrsCard(seed);
+      }
+    }
   const rows = await db.select<CardRow[]>(
     `SELECT c.*, i.descriptive_filename AS image_filename, i.occlusion_boxes_json AS image_boxes
        FROM srs_cards c
@@ -395,4 +404,195 @@ export async function loadDueCards(limit = 200, now: Date = new Date()): Promise
       lastReview: r.last_review ?? undefined,
     })
   );
+  } catch {
+    const local = getLocalCachedCards();
+    return local
+      .filter((c) => new Date(c.dueDate).getTime() <= now.getTime() || c.state === 0 || c.state === 1)
+      .slice(0, limit);
+  }
+}
+
+
+const LOCAL_CARDS_STORAGE_KEY = "studyapp_local_srs_cards";
+
+export const DEFAULT_SEED_CARDS: SrsCard[] = [
+  {
+    id: "seed_renal_mcq_01",
+    organSystem: "Renal",
+    cardType: "mcq",
+    questionOrder: 2,
+    frontPrompt:
+      "A patient with bilateral renal artery stenosis is started on lisinopril. Within 5 days, serum creatinine rises from 1.1 to 2.6 mg/dL. Loss of which physiological mechanism directly caused the acute drop in GFR?",
+    markScheme:
+      "Angiotensin II preferentially constricts the efferent arteriole via AT1 receptors to preserve glomerular capillary hydrostatic pressure when renal perfusion is reduced. ACE inhibition removes this efferent tone, lowering filtration fraction and GFR.",
+    mcqOptionsJson: JSON.stringify([
+      "Adenosine A1-mediated dilation of the afferent arteriole",
+      "Angiotensin II AT1-mediated constriction of the efferent arteriole",
+      "Prostaglandin E2-mediated constriction of the vasa recta",
+      "Aldosterone-mediated Na+ reabsorption in the cortical collecting duct",
+    ]),
+    mcqCorrectIndex: 1,
+    stability: 4.5,
+    difficulty: 5.2,
+    elapsedDays: 1,
+    scheduledDays: 4,
+    reps: 1,
+    lapses: 0,
+    state: 0,
+    learningStep: 0,
+    dueDate: new Date(0).toISOString(),
+  },
+  {
+    id: "seed_renal_written_02",
+    organSystem: "Renal",
+    cardType: "written",
+    questionOrder: 3,
+    frontPrompt:
+      "Explain the tubuloglomerular feedback (TGF) cascade triggered when NaCl delivery to the macula densa increases, and how it alters single-nephron GFR.",
+    markScheme:
+      "Increased NaCl uptake via NKCC2 in macula densa cells elevates intracellular ATP/adenosine release, which binds A1 receptors on afferent arteriolar smooth muscle to cause vasoconstriction and inhibit renin secretion from juxtaglomerular granular cells, lowering glomerular hydrostatic pressure and restoring GFR.",
+    stability: 3.1,
+    difficulty: 5.8,
+    elapsedDays: 0,
+    scheduledDays: 0,
+    reps: 0,
+    lapses: 0,
+    state: 0,
+    learningStep: 0,
+    dueDate: new Date(0).toISOString(),
+  },
+  {
+    id: "seed_cardio_fill_03",
+    organSystem: "Cardiovascular",
+    cardType: "fill_in_gap",
+    questionOrder: 2,
+    frontPrompt:
+      "During sympathetic beta-1 adrenergic stimulation of ventricular myocardium, PKA phosphorylates [___] to relieve inhibition on SERCA2a, accelerating Ca2+ reuptake into the sarcoplasmic reticulum and enhancing lusitropy.",
+    markScheme:
+      "Phospholamban phosphorylation by protein kinase A (PKA) removes its tonic inhibition of SERCA2a, accelerating diastolic Ca2+ sequestration into the sarcoplasmic reticulum (positive lusitropy).",
+    stability: 6.0,
+    difficulty: 4.9,
+    elapsedDays: 0,
+    scheduledDays: 0,
+    reps: 0,
+    lapses: 0,
+    state: 0,
+    learningStep: 0,
+    dueDate: new Date(0).toISOString(),
+  },
+  {
+    id: "seed_renal_occ_04",
+    organSystem: "Renal",
+    cardType: "image_occlusion",
+    questionOrder: 2,
+    frontPrompt:
+      "Identify the occluded microvascular and tubular structures of the Juxtaglomerular Apparatus and Glomerular Filtration Barrier:",
+    markScheme:
+      "1) Afferent Arteriole (Juxtaglomerular Granular Cells), 2) Efferent Arteriole (AT1 Receptor Target), 3) Macula Densa (Distal Convoluted Tubule NaCl Sensor).",
+    imagePath: "E:/StudyApp/MyFiles/images/renal_juxtaglomerular_apparatus.png",
+    occlusionBoxesJson: JSON.stringify([
+      {
+        id: "occ_1",
+        label_text: "Afferent Arteriole — Juxtaglomerular Granular Renin Cells",
+        x_pct: 12,
+        y_pct: 18,
+        width_pct: 32,
+        height_pct: 12,
+      },
+      {
+        id: "occ_2",
+        label_text: "Efferent Arteriole — Angiotensin II AT1 Constriction Site",
+        x_pct: 54,
+        y_pct: 22,
+        width_pct: 34,
+        height_pct: 12,
+      },
+      {
+        id: "occ_3",
+        label_text: "Macula Densa — NKCC2 NaCl Sensor & Adenosine Paracrine Pole",
+        x_pct: 24,
+        y_pct: 66,
+        width_pct: 46,
+        height_pct: 12,
+      },
+    ]),
+    stability: 5.0,
+    difficulty: 5.0,
+    elapsedDays: 0,
+    scheduledDays: 0,
+    reps: 0,
+    lapses: 0,
+    state: 0,
+    learningStep: 0,
+    dueDate: new Date(0).toISOString(),
+  },
+];
+
+export function getLocalCachedCards(): SrsCard[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_CARDS_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  try {
+    localStorage.setItem(LOCAL_CARDS_STORAGE_KEY, JSON.stringify(DEFAULT_SEED_CARDS));
+  } catch {
+    // Ignore storage write errors
+  }
+  return [...DEFAULT_SEED_CARDS];
+}
+
+export function saveLocalCachedCards(cards: SrsCard[]): void {
+  try {
+    localStorage.setItem(LOCAL_CARDS_STORAGE_KEY, JSON.stringify(cards));
+  } catch {
+    // Ignore storage write errors
+  }
+}
+
+export async function createSrsCard(newCard: SrsCard): Promise<SrsCard> {
+  const existing = getLocalCachedCards().filter((c) => c.id !== newCard.id);
+  saveLocalCachedCards([newCard, ...existing]);
+
+  try {
+    const db = await Database.load(SQLITE_DB_URI);
+    await db.execute(
+      `INSERT OR REPLACE INTO srs_cards
+       (id, document_id, organ_system, card_type, question_order, front_prompt, mark_scheme,
+        mcq_options_json, mcq_correct_index, image_id, occlusion_Boxes_json,
+        stability, difficulty, elapsed_days, scheduled_days, reps, lapses, state, learning_step, due_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
+      [
+        newCard.id,
+        newCard.documentId ?? null,
+        newCard.organSystem,
+        newCard.cardType,
+        newCard.questionOrder,
+        newCard.frontPrompt,
+        newCard.markScheme,
+        newCard.mcqOptionsJson ?? null,
+        newCard.mcqCorrectIndex ?? null,
+        newCard.imageId ?? null,
+        newCard.occlusionBoxesJson ?? null,
+        newCard.stability,
+        newCard.difficulty,
+        newCard.elapsedDays,
+        newCard.scheduledDays,
+        newCard.reps,
+        newCard.lapses,
+        newCard.state,
+        newCard.learningStep ?? 0,
+        newCard.dueDate,
+      ]
+    );
+  } catch {
+    // Persisted in local cache fallback when running outside Tauri SQLite runtime
+  }
+  return newCard;
 }

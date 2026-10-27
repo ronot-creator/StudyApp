@@ -9,9 +9,10 @@ import {
   NodeMouseHandler,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { readTextFile } from "@tauri-apps/plugin-fs";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import Database from "@tauri-apps/plugin-sql";
 import { CANONICAL_ORGAN_SYSTEMS, OrganSystem } from "../../types/study";
-import { getNgrokGrader } from "../../services/ngrokGrader";
+import { getNgrokGrader, SQLITE_DB_URI } from "../../services/ngrokGrader";
 
 export interface ParsedTriple {
   id: string;
@@ -35,7 +36,9 @@ export interface MindMapCanvasProps {
   onOrganSystemChange?: (system: OrganSystem) => void;
 }
 
-const DEFAULT_SYSTEM_VAULT_MARKDOWN: Record<OrganSystem, string> = {
+export const VAULT_STORAGE_PREFIX = "studyapp_vault_md_";
+
+export const DEFAULT_SYSTEM_VAULT_MARKDOWN: Record<OrganSystem, string> = {
   Renal: `# Glomerular Filtration & Tubuloglomerular Feedback (TGF)
 
 The renal corpuscle autoregulates GFR across systemic pressures (80–180 mmHg) via myogenic stretch and macula densa paracrine signaling.
@@ -46,7 +49,11 @@ The renal corpuscle autoregulates GFR across systemic pressures (80–180 mmHg) 
 [Juxtaglomerular Granular Cells] --(secrete renin in response to beta-1 and low NaCl to generate)--> [Angiotensin II]
 [Angiotensin II] --(preferentially constricts AT1 receptors on)--> [Efferent Arteriole]
 [Angiotensin II] --(increases systemic arterial afterload and venous return in)--> [Cardiovascular::Left Ventricular Preload]
-\`\`\``,
+\`\`\`
+
+<!-- thought-anchor:ta_renal_01 -->
+> **[AI Margin Note #ta_renal_01]:** In bilateral renal artery stenosis, glomerular hydrostatic pressure is critically dependent on Angiotensin II-mediated efferent arteriolar tone. Starting an ACE inhibitor removes this constriction and causes an acute rise in serum creatinine.
+<!-- /thought-anchor:ta_renal_01 -->`,
   Cardiovascular: `# Ventricular-Vascular Coupling & Frank-Starling Law
 
 Sarcomere length-tension dependence increases stroke volume in response to elevated end-diastolic volume via heightened troponin C calcium sensitivity.
@@ -119,6 +126,72 @@ Sarcomere length-tension dependence increases stroke volume in response to eleva
 [Systemic Sympathetic Outflow] --(activates juxtaglomerular beta-1 receptors in)--> [Renal::Renin-Angiotensin-Aldosterone Axis]
 \`\`\``,
 };
+
+export function getSafeVaultFilename(organSystem: OrganSystem): string {
+  return organSystem.replace(/[^A-Za-z0-9_-]+/g, "_");
+}
+
+export async function readOrganSystemVaultMarkdown(organSystem: OrganSystem): Promise<string> {
+  const safeName = getSafeVaultFilename(organSystem);
+  const vaultFilePath = `E:\\StudyApp\\MyFiles\\vault\\${safeName}.md`;
+  try {
+    const diskText = await readTextFile(vaultFilePath);
+    if (diskText && diskText.trim().length > 0) {
+      try {
+        localStorage.setItem(`${VAULT_STORAGE_PREFIX}${organSystem}`, diskText);
+      } catch {
+        // ignore storage error
+      }
+      return diskText;
+    }
+  } catch {
+    // Fallback to localStorage or built-in system markdown
+  }
+
+  try {
+    const cached = localStorage.getItem(`${VAULT_STORAGE_PREFIX}${organSystem}`);
+    if (cached && cached.trim().length > 0) {
+      return cached;
+    }
+  } catch {
+    // ignore storage error
+  }
+
+  return DEFAULT_SYSTEM_VAULT_MARKDOWN[organSystem];
+}
+
+export async function writeOrganSystemVaultMarkdown(
+  organSystem: OrganSystem,
+  markdownContent: string
+): Promise<void> {
+  try {
+    localStorage.setItem(`${VAULT_STORAGE_PREFIX}${organSystem}`, markdownContent);
+  } catch {
+    // ignore storage error
+  }
+
+  const safeName = getSafeVaultFilename(organSystem);
+  const vaultFilePath = `E:\\StudyApp\\MyFiles\\vault\\${safeName}.md`;
+  try {
+    await writeTextFile(vaultFilePath, markdownContent);
+  } catch {
+    // Safe fallback in browser preview
+  }
+}
+
+export function appendTripleToVaultMarkdown(
+  markdownContent: string,
+  tripleLine: string
+): string {
+  const blockRegex = /(```mindmap\s*[\s\S]*?)(```)/i;
+  if (blockRegex.test(markdownContent)) {
+    return markdownContent.replace(blockRegex, (_full, body: string, close: string) => {
+      const trimmed = body.replace(/\s+$/, "");
+      return `${trimmed}\n${tripleLine}\n${close}`;
+    });
+  }
+  return `${markdownContent.trim()}\n\n\`\`\`mindmap\n${tripleLine}\n\`\`\`\n`;
+}
 
 /**
  * Extracts only the text enclosed inside ` \`\`\`mindmap ... \`\`\` ` fenced code blocks.
@@ -292,6 +365,13 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   } | null>(null);
   const [extractingColab, setExtractingColab] = useState<boolean>(false);
 
+  // Interactive Triple Builder state
+  const [newSourceNode, setNewSourceNode] = useState<string>("");
+  const [newLinkingPhrase, setNewLinkingPhrase] = useState<string>("");
+  const [newTargetNode, setNewTargetNode] = useState<string>("");
+  const [newBridgeSystem, setNewBridgeSystem] = useState<string>("");
+  const [saveToast, setSaveToast] = useState<string | null>(null);
+
   const handleSelectSystem = useCallback(
     (nextSystem: OrganSystem) => {
       setInternalSystem(nextSystem);
@@ -307,18 +387,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     setSelectedPortalNode(null);
 
     const loadVaultMarkdownForSystem = async () => {
-      const vaultFilePath = `E:\\StudyApp\\MyFiles\\vault\\${activeSystem}.md`;
-      let markdownContent = DEFAULT_SYSTEM_VAULT_MARKDOWN[activeSystem];
-
-      try {
-        const diskText = await readTextFile(vaultFilePath);
-        if (diskText && diskText.trim().length > 0) {
-          markdownContent = diskText;
-        }
-      } catch {
-        // Fallback to strict system-scoped local default when running in browser preview or before file creation
-      }
-
+      const markdownContent = await readOrganSystemVaultMarkdown(activeSystem);
       if (cancelled) return;
       setSyntaxInput(markdownContent);
       const parsed = parseMarkdownMindMapTriples(activeSystem, markdownContent);
@@ -333,12 +402,68 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     };
   }, [activeSystem, propOrganSystem]);
 
+  const persistGraphToSqlite = async (system: OrganSystem, parsedTriples: ParsedTriple[]) => {
+    try {
+      const db = await Database.load(SQLITE_DB_URI);
+      for (const idx of parsedTriples.keys()) {
+        const t = parsedTriples[idx];
+        const srcId = `node_${system}_${t.sourceNode.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+        const tgtId = `node_${system}_${t.targetNode.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+        await db.execute(
+          `INSERT OR REPLACE INTO mindmap_nodes (id, organ_system, label, position_x, position_y)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [srcId, system, t.sourceNode, (idx % 2) * 380 + 60, Math.floor(idx / 2) * 145 + 40]
+        );
+        await db.execute(
+          `INSERT OR REPLACE INTO mindmap_nodes (id, organ_system, label, position_x, position_y)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [tgtId, t.targetOrganSystem ?? system, t.targetNode, 440, Math.floor(idx / 2) * 145 + 100]
+        );
+        await db.execute(
+          `INSERT OR REPLACE INTO mindmap_edges (id, source_node_id, target_node_id, linking_phrase, is_cross_system_bridge, target_organ_system)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            t.id,
+            srcId,
+            tgtId,
+            t.linkingPhrase.slice(0, 240),
+            t.isCrossSystemBridge ? 1 : 0,
+            t.targetOrganSystem ?? null,
+          ]
+        );
+      }
+    } catch {
+      // Safe fallback in browser preview
+    }
+  };
+
   const handleSyntaxChange = (nextMarkdown: string) => {
     setSyntaxInput(nextMarkdown);
     const parsed = parseMarkdownMindMapTriples(activeSystem, nextMarkdown);
     const nextGraph = buildGraphFromTriples(parsed);
     setNodes(nextGraph.nodes);
     setEdges(nextGraph.edges);
+    void writeOrganSystemVaultMarkdown(activeSystem, nextMarkdown);
+  };
+
+  const handleAddTriple = async () => {
+    if (!newSourceNode.trim() || !newLinkingPhrase.trim() || !newTargetNode.trim()) return;
+    const cappedPhrase = newLinkingPhrase.trim().split(/\s+/).slice(0, 30).join(" ");
+    const targetExpr =
+      newBridgeSystem && newBridgeSystem !== activeSystem
+        ? `${newBridgeSystem}::${newTargetNode.trim()}`
+        : newTargetNode.trim();
+    const tripleLine = `[${newSourceNode.trim()}] --(${cappedPhrase})--> [${targetExpr}]`;
+    const updatedMd = appendTripleToVaultMarkdown(syntaxInput, tripleLine);
+    handleSyntaxChange(updatedMd);
+    const parsed = parseMarkdownMindMapTriples(activeSystem, updatedMd);
+    await persistGraphToSqlite(activeSystem, parsed);
+    setNewSourceNode("");
+    setNewLinkingPhrase("");
+    setNewTargetNode("");
+    setNewBridgeSystem("");
+    setSaveToast(`Added triple to ${activeSystem}.md & SQLite mindmap_edges`);
+    window.setTimeout(() => setSaveToast(null), 4000);
   };
 
   const handleNodeClick: NodeMouseHandler<Node<MindMapNodeData>> = useCallback((_event, node) => {
@@ -390,10 +515,10 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           const formattedLines = data.triples
             .map(
               (t: any) =>
-                `[${t.source_node}] --(${t.linking_phrase})--> [${
+                `[${t.source_node || t.source}] --(${t.linking_phrase})--> [${
                   t.is_cross_system_bridge && t.target_organ_system
-                    ? `${t.target_organ_system}::${t.target_node}`
-                    : t.target_node
+                    ? `${t.target_organ_system}::${t.target_node || t.target}`
+                    : t.target_node || t.target
                 }]`
             )
             .join("\n");
@@ -411,6 +536,20 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "14px", height: "100%" }}>
+      {saveToast && (
+        <div
+          className="liquid-card"
+          style={{
+            padding: "9px 14px",
+            fontSize: "12.5px",
+            borderColor: "rgba(52, 211, 153, 0.5)",
+            background: "rgba(6, 78, 59, 0.35)",
+          }}
+        >
+          {saveToast}
+        </div>
+      )}
+
       <div
         className="liquid-card"
         style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap" }}
@@ -469,8 +608,55 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         </div>
       </div>
 
+      {/* Interactive Triple Builder Bar */}
+      <div className="liquid-card" style={{ padding: "12px 16px" }}>
+        <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "8px" }}>
+          Add Physiological Causal Link (auto-appends to <code>```mindmap</code> block in{" "}
+          <code>E:\StudyApp\MyFiles\vault\{getSafeVaultFilename(activeSystem)}.md</code>)
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1.6fr 1.2fr 1fr auto", gap: "8px" }}>
+          <input
+            className="liquid-input"
+            placeholder="Source Node (e.g. Macula Densa)"
+            value={newSourceNode}
+            onChange={(e) => setNewSourceNode(e.target.value)}
+          />
+          <input
+            className="liquid-input"
+            placeholder="Linking phrase <= 30 words (e.g. releases adenosine to constrict)"
+            value={newLinkingPhrase}
+            onChange={(e) => setNewLinkingPhrase(e.target.value)}
+          />
+          <input
+            className="liquid-input"
+            placeholder="Target Node (e.g. Afferent Arteriole)"
+            value={newTargetNode}
+            onChange={(e) => setNewTargetNode(e.target.value)}
+          />
+          <select
+            className="liquid-select"
+            value={newBridgeSystem}
+            onChange={(e) => setNewBridgeSystem(e.target.value)}
+          >
+            <option value="">Same System ({activeSystem})</option>
+            {CANONICAL_ORGAN_SYSTEMS.filter((s) => s !== activeSystem).map((s) => (
+              <option key={s} value={s}>
+                Bridge &rarr; {s}
+              </option>
+            ))}
+          </select>
+          <button
+            className="liquid-btn"
+            onClick={() => void handleAddTriple()}
+            disabled={!newSourceNode.trim() || !newLinkingPhrase.trim() || !newTargetNode.trim()}
+          >
+            + Add Link
+          </button>
+        </div>
+      </div>
+
       <div
-        style={{ position: "relative", height: "380px", borderRadius: "14px", overflow: "hidden" }}
+        style={{ position: "relative", height: "360px", borderRadius: "14px", overflow: "hidden" }}
         className="liquid-card"
       >
         <ReactFlow
@@ -516,7 +702,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
 
       <div className="liquid-card">
         <label style={{ display: "block", fontSize: "12px", color: "#94a3b8", marginBottom: "6px" }}>
-          Dual-Syntax Vault Note (<code>E:\StudyApp\MyFiles\vault\{activeSystem}.md</code> — only{" "}
+          Dual-Syntax Vault Note (<code>E:\StudyApp\MyFiles\vault\{getSafeVaultFilename(activeSystem)}.md</code> — only{" "}
           <code>```mindmap</code> blocks are parsed into graph nodes)
         </label>
         <textarea

@@ -1,72 +1,140 @@
 """
 StudyApp Local MCP Server (The Local Bridge)
-Implements the 5 constitutional MCP tools + localhost:47821 highlight receiver & SQLite thought_anchors persistence.
+Implements the 5 tool schemas specified in Constitution.md Section 6, plus a
+loopback-only HTTP bridge (127.0.0.1:47821) the Tauri shell uses to push highlight state.
 """
+import hashlib
+import json
+import os
 import re
 import sqlite3
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import json
-from typing import List, Dict, Any
-from mcp.server.fastmcp import FastMCP
-from .sandbox import resolve_sandboxed_path, check_disk_quota, SRS_DATA_DIR
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    try:
+        from mcp.server.mcpserver import MCPServer as FastMCP
+    except ImportError:
+        class FastMCP:  # type: ignore[no-redef]
+            def __init__(self, name: str):
+                self.name = name
+            def tool(self):
+                def decorator(fn):
+                    return fn
+                return decorator
+            def run(self):
+                pass
+
+from . import sandbox as _sandbox
+from .sandbox import (
+    resolve_sandboxed_path,
+    check_disk_quota,
+    safe_write_text,
+)
 
 mcp = FastMCP("StudyApp-Local-Bridge")
 
+BRIDGE_HOST = "127.0.0.1"
+BRIDGE_PORT = int(os.environ.get("STUDYAPP_BRIDGE_PORT", "47821"))
+_MAX_BODY_BYTES = 1024 * 1024
+
+_STATE_LOCK = threading.Lock()
 _ACTIVE_HIGHLIGHT_STATE: Dict[str, str] = {
     "active_file": "",
     "selected_text": "",
     "surrounding_context": "",
 }
+_HIGHLIGHT_KEYS = tuple(_ACTIVE_HIGHLIGHT_STATE)
+
+
+def _db() -> sqlite3.Connection:
+    """Opens studyapp_srs.db, creating it from schema.sql on first use."""
+    srs_dir = Path(getattr(_sandbox, "SRS_DATA_DIR", _sandbox.SANDBOX_ROOT / "srs_data"))
+    db_path = Path(getattr(_sandbox, "DB_PATH", srs_dir / "studyapp_srs.db"))
+    srs_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    has_schema = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='thought_anchors'"
+    ).fetchone()
+    if not has_schema:
+        schema = srs_dir / "schema.sql"
+        if schema.exists():
+            conn.executescript(schema.read_text(encoding="utf-8"))
+    return conn
+
+
+def _resolve_markdown(active_file: str) -> Path:
+    """Resolves a file name from the UI (with or without 'vault/' prefix) inside the sandbox."""
+    candidate = resolve_sandboxed_path(active_file)
+    if not candidate.exists() and not active_file.replace("\\", "/").startswith("vault/"):
+        candidate = resolve_sandboxed_path(f"vault/{active_file}")
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Active Markdown file not found: {active_file}")
+    return candidate
+
+
+_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+
+
+def markdown_blocks(text: str) -> List[Tuple[int, int]]:
+    """Splits Markdown into blocks (paragraphs, lists, fenced code, ...) separated by
+    blank lines. Returns [(start, end)] character offsets; `end` excludes the trailing
+    newline. Blank lines inside fenced code do not split a block. Fully deterministic."""
+    blocks: List[Tuple[int, int]] = []
+    pos = 0
+    start = None
+    end = 0
+    in_fence = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+        if stripped == "" and not in_fence:
+            if start is not None:
+                blocks.append((start, end))
+                start = None
+        else:
+            if start is None:
+                start = pos
+            end = pos + len(line.rstrip("\r\n"))
+        pos += len(line)
+    if start is not None:
+        blocks.append((start, end))
+    return blocks
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def find_anchor_insert_offset(text: str, excerpt: str) -> int:
+    """Returns the offset right after the Markdown block containing the END of `excerpt`."""
+    blocks = markdown_blocks(text)
+    idx = text.find(excerpt)
+    if idx >= 0:
+        last_char = idx + len(excerpt) - 1
+        for s, e in blocks:
+            if s <= last_char <= e:
+                return e
+    target = _norm(excerpt)
+    if target:
+        for s, e in blocks:
+            if target in _norm(text[s:e]):
+                return e
+    raise ValueError("Highlighted text could not be located in the active Markdown file.")
 
 
 def compute_surgical_insertion_offset(markdown_text: str, selected_text: str) -> int:
-    """
-    Finds the paragraph or fenced code block containing `selected_text`
-    and returns the character offset immediately after that block (or after the closing fence).
-    """
-    if not selected_text or selected_text not in markdown_text:
+    """Compatibility alias for find_anchor_insert_offset."""
+    try:
+        return find_anchor_insert_offset(markdown_text, selected_text)
+    except ValueError:
         return len(markdown_text)
-
-    match_pos = markdown_text.find(selected_text)
-    fence_pattern = re.compile(r"(^```[\s\S]*?^```)", re.MULTILINE)
-    for fence_match in fence_pattern.finditer(markdown_text):
-        start, end = fence_match.span()
-        if start <= match_pos < end:
-            return end
-
-    para_end = markdown_text.find("\n\n", match_pos + len(selected_text))
-    if para_end == -1:
-        return len(markdown_text)
-    return para_end
-
-
-class HighlightBridgeHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        if self.path == "/highlight":
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length).decode("utf-8")
-            payload = json.loads(raw)
-            _ACTIVE_HIGHLIGHT_STATE["active_file"] = payload.get("active_file", "")
-            _ACTIVE_HIGHLIGHT_STATE["selected_text"] = payload.get("selected_text", "")
-            _ACTIVE_HIGHLIGHT_STATE["surrounding_context"] = payload.get("surrounding_context", "")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "state": _ACTIVE_HIGHLIGHT_STATE}).encode("utf-8"))
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_highlight_http_bridge(host: str = "127.0.0.1", port: int = 47821) -> HTTPServer:
-    server = HTTPServer((host, port), HighlightBridgeHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server
 
 
 @mcp.tool()
@@ -86,64 +154,165 @@ def list_my_files(directory: str = "vault") -> List[str]:
 @mcp.tool()
 def read_file(filename: str) -> str:
     """Pipes local file text directly into the model's context window."""
-    target = resolve_sandboxed_path(filename)
+    target = _resolve_markdown(filename) if filename.endswith(".md") else resolve_sandboxed_path(filename)
     return target.read_text(encoding="utf-8")
 
 
 @mcp.tool()
-def write_markdown(filename: str, content: str) -> Dict[str, Any]:
+def write_markdown(filename: str, content: str, organ_system: str = "General") -> Dict[str, Any]:
     """Saves processed textbook chunks or generated SRS cards directly to the E:\\ drive."""
-    encoded = content.encode("utf-8")
-    quota = check_disk_quota(len(encoded))
     if not filename.endswith(".md"):
         filename = f"{filename}.md"
-    target = resolve_sandboxed_path(f"vault/{filename}" if not filename.startswith("vault") else filename)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    rel_arg = f"vault/{filename}" if not filename.replace("\\", "/").startswith("vault") else filename
+    target = safe_write_text(rel_arg, content)
+    quota = check_disk_quota(0)
+
+    try:
+        vault_dir = Path(getattr(_sandbox, "VAULT_DIR", _sandbox.SANDBOX_ROOT / "vault"))
+        rel = target.relative_to(vault_dir).as_posix()
+    except ValueError:
+        rel = target.name
+    document_id = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16]
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    try:
+        with _db() as conn:
+            conn.execute(
+                """
+                INSERT INTO vault_documents (id, organ_system, relative_path, checksum_sha256)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(relative_path) DO UPDATE SET
+                    organ_system = excluded.organ_system,
+                    checksum_sha256 = excluded.checksum_sha256,
+                    updated_at = datetime('now')
+                """,
+                (document_id, organ_system, rel, checksum),
+            )
+    except Exception:
+        pass
+
     return {"status": "saved", "path": str(target), "quota": quota}
 
 
 @mcp.tool()
 def get_active_highlight() -> Dict[str, str]:
     """Returns the text currently selected by the user in the UI, plus surrounding context."""
-    return dict(_ACTIVE_HIGHLIGHT_STATE)
+    with _STATE_LOCK:
+        return dict(_ACTIVE_HIGHLIGHT_STATE)
 
 
 @mcp.tool()
 def save_thought_anchor(anchor_id: str, explanation: str) -> Dict[str, Any]:
-    """Writes a customized AI margin-note back into the active Markdown file and SQLite thought_anchors table."""
-    active_file = _ACTIVE_HIGHLIGHT_STATE.get("active_file")
-    selected_text = _ACTIVE_HIGHLIGHT_STATE.get("selected_text", "")
+    """Writes a customized AI margin-note into the active Markdown file, injected inline
+    directly below the highlighted paragraph, and records it in the thought_anchors table."""
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", anchor_id):
+        raise ValueError("anchor_id must be 1-64 chars of [A-Za-z0-9_-].")
+    with _STATE_LOCK:
+        active_file = _ACTIVE_HIGHLIGHT_STATE.get("active_file", "")
+        excerpt = _ACTIVE_HIGHLIGHT_STATE.get("selected_text", "")
     if not active_file:
         raise ValueError("No active Markdown file is currently registered in the highlight state.")
+    if not excerpt.strip():
+        raise ValueError("No highlighted text is registered; select a passage first.")
 
-    target = resolve_sandboxed_path(active_file)
-    existing = target.read_text(encoding="utf-8")
+    target = _resolve_markdown(active_file)
+    original = target.read_text(encoding="utf-8")
+    if f"<!-- thought-anchor:{anchor_id} -->" in original:
+        raise ValueError(f"Thought anchor '{anchor_id}' already exists in {target.name}.")
+
+    offset = find_anchor_insert_offset(original, excerpt)
+    note = "\n".join(f"> {ln}" if ln.strip() else ">" for ln in explanation.strip().splitlines())
     anchor_block = (
         f"\n\n<!-- thought-anchor:{anchor_id} -->\n"
-        f"> **[AI Margin Note #{anchor_id}]:** {explanation}\n"
+        f"> **[AI Margin Note #{anchor_id}]:** {explanation.strip()}\n"
+        f"{note}\n"
         f"<!-- /thought-anchor:{anchor_id} -->"
     )
-    check_disk_quota(len(anchor_block.encode("utf-8")))
-    offset = compute_surgical_insertion_offset(existing, selected_text)
-    updated = existing[:offset] + anchor_block + existing[offset:]
-    target.write_text(updated, encoding="utf-8")
+    updated = original[:offset] + anchor_block + original[offset:]
 
-    db_path = SRS_DATA_DIR / "studyapp_srs.db"
-    if db_path.exists():
-        with sqlite3.connect(db_path) as conn:
+    vault_dir = Path(getattr(_sandbox, "VAULT_DIR", _sandbox.SANDBOX_ROOT / "vault"))
+    try:
+        rel = target.relative_to(vault_dir).as_posix()
+    except ValueError:
+        rel = target.name
+    document_id = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16]
+
+    safe_write_text(target, updated)
+    try:
+        with _db() as conn:
             conn.execute(
-                """
-                INSERT OR REPLACE INTO thought_anchors (anchor_id, document_id, highlighted_excerpt, ai_explanation, block_offset)
-                VALUES (?, COALESCE((SELECT id FROM vault_documents WHERE relative_path = ? LIMIT 1), 'default_doc'), ?, ?, ?)
-                """,
-                (anchor_id, active_file, selected_text, explanation, offset),
+                "INSERT OR IGNORE INTO vault_documents (id, organ_system, relative_path) VALUES (?, 'Unclassified', ?)",
+                (document_id, rel),
             )
-            conn.commit()
+            row = conn.execute("SELECT id FROM vault_documents WHERE relative_path = ?", (rel,)).fetchone()
+            conn.execute(
+                "INSERT INTO thought_anchors (anchor_id, document_id, highlighted_excerpt, ai_explanation, block_offset) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (anchor_id, row[0], excerpt, explanation, offset),
+            )
+    except Exception:
+        target.write_text(original, encoding="utf-8")
+        raise
+    return {
+        "status": "anchored",
+        "anchor_id": anchor_id,
+        "file": str(target),
+        "offset": offset,
+        "inserted_at_offset": offset,
+    }
 
-    return {"status": "anchored", "anchor_id": anchor_id, "file": str(target), "offset": offset}
+
+class _BridgeHandler(BaseHTTPRequestHandler):
+    def _reply(self, code: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/health":
+            self._reply(200, {"status": "ok"})
+        elif self.path == "/highlight":
+            self._reply(200, get_active_highlight())
+        else:
+            self._reply(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/highlight":
+            return self._reply(404, {"error": "not found"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > _MAX_BODY_BYTES:
+                return self._reply(413, {"error": "invalid body size"})
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Payload must be a JSON object")
+            update = {k: str(data.get(k, "")) for k in _HIGHLIGHT_KEYS}
+        except (ValueError, TypeError, AttributeError):
+            return self._reply(400, {"error": "invalid JSON"})
+        with _STATE_LOCK:
+            _ACTIVE_HIGHLIGHT_STATE.update(update)
+        self._reply(200, {"status": "updated", "state": dict(_ACTIVE_HIGHLIGHT_STATE)})
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+HighlightBridgeHandler = _BridgeHandler
+
+
+def start_bridge(host: str = BRIDGE_HOST, port: Optional[int] = None) -> ThreadingHTTPServer:
+    actual_port = BRIDGE_PORT if port is None else port
+    httpd = ThreadingHTTPServer((host, actual_port), _BridgeHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True, name="studyapp-bridge").start()
+    return httpd
+
+
+start_highlight_http_bridge = start_bridge
 
 
 if __name__ == "__main__":
-    start_highlight_http_bridge()
+    start_bridge()
     mcp.run()

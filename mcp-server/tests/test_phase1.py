@@ -10,7 +10,7 @@ import pytest
 
 from src import sandbox, server
 
-REAL_SCHEMA = Path(r"E:\StudyApp\MyFiles\srs_data\schema.sql")
+REAL_SCHEMA = Path(r"E:\StudyApp\MyFiles\srs_data\schema.sql") if Path(r"E:\StudyApp\MyFiles\srs_data\schema.sql").exists() else Path(__file__).resolve().parents[2] / "MyFiles" / "srs_data" / "schema.sql"
 
 NOTE = (
     "# Renal\n\n"

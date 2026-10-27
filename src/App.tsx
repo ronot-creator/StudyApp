@@ -7,6 +7,7 @@ import { TunnelStatus } from "./components/TunnelStatus";
 import { VaultReader } from "./components/vault/VaultReader";
 import { FsrsRunner } from "./components/srs/FsrsRunner";
 import { MindMapCanvas } from "./components/mindmap/MindMapCanvas";
+import { createSrsCard } from "./lib/fsrs";
 import {
   DEFAULT_CURATED_REPOSITORIES,
   SourcedMedicalAsset,
@@ -322,8 +323,37 @@ export default function App() {
                             }}
                           />
                         )}
-                        <div style={{ color: "#94a3b8", marginTop: "4px" }}>
-                          Credit: {a.sourceCredit} | Occlusion Masks: {a.occlusionBoxes.length}
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", color: "#94a3b8", marginTop: "6px", gap: "8px", flexWrap: "wrap" }}>
+                          <span>Credit: {a.sourceCredit} | Occlusion Masks: {a.occlusionBoxes.length}</span>
+                          <button
+                            className="liquid-btn"
+                            style={{ padding: "4px 10px", fontSize: "11.5px" }}
+                            onClick={async () => {
+                              await createSrsCard({
+                                id: `occ_card_${Date.now()}`,
+                                organSystem: a.organSystem,
+                                cardType: "image_occlusion",
+                                questionOrder: 2,
+                                frontPrompt: `Identify the occluded anatomical structures on ${a.descriptiveFilename} (${a.organSystem}):`,
+                                markScheme: a.occlusionBoxes.map((b) => b.label_text).join(" | "),
+                                imageId: a.id,
+                                imagePath: `E:/StudyApp/MyFiles/images/${a.descriptiveFilename}`,
+                                occlusionBoxesJson: JSON.stringify(a.occlusionBoxes),
+                                stability: 0,
+                                difficulty: 5.0,
+                                elapsedDays: 0,
+                                scheduledDays: 0,
+                                reps: 0,
+                                lapses: 0,
+                                state: 0,
+                                learningStep: 0,
+                                dueDate: new Date().toISOString(),
+                              });
+                              setActiveTab("srs");
+                            }}
+                          >
+                            🃏 Study in FSRS Occlusion Deck
+                          </button>
                         </div>
                       </div>
                     ))}
