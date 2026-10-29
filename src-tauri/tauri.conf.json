@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "StudyApp",
-  "version": "0.1.0",
-  "identifier": "com.medicalpipeline.studyapp",
+  "productName": "Convergence",
+  "version": "0.2.0",
+  "identifier": "com.convergence.studyapp",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "StudyApp \u2014 Local-First Medical AI Pipeline",
+        "title": "Convergence \u2014 Local-First AI Knowledge Operating System",
         "width": 1600,
         "height": 960,
         "resizable": true,
@@ -29,14 +29,17 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "E:/StudyApp/MyFiles/**",
-          "E:\\StudyApp\\MyFiles\\**"
+          "$APPLOCALDATA",
+          "$APPLOCALDATA/**"
         ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "externalBin": [
+      "bin/mcp-sidecar"
+    ]
   }
 }

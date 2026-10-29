@@ -7,15 +7,12 @@ use tauri::{
     LogicalPosition, LogicalSize, Manager, State, WebviewBuilder, WebviewUrl, WebviewWindowBuilder,
 };
 
-/// Strict Hardware Root Sandbox defined in Constitution.md Section 3
-pub const SANDBOX_ROOT: &str = r"E:\StudyApp\MyFiles";
-/// Persistent Browser Partition directory enforcing `persist:study_session`
-pub const STUDY_SESSION_PARTITION_DIR: &str =
-    r"E:\StudyApp\MyFiles\.webview_partitions\persist_study_session";
+/// Localhost MCP Sidecar port (bound on startup via `Command::new_sidecar("mcp-sidecar")`)
+pub const MCP_SIDECAR_PORT: u16 = 1420;
 /// Localhost HTTP highlight bridge endpoint in mcp-server
 pub const HIGHLIGHT_BRIDGE_URL: &str = "http://127.0.0.1:47821/highlight";
 
-/// WebView2 RAM Diet & Lag Optimization flags applied before Tauri boots (Constitution Section 4)
+/// WebView2 RAM Diet & Lag Optimization flags applied before Tauri boots
 pub const WEBVIEW2_RAM_DIET_ARGS: &str =
     "--process-per-site --enable-features=msWebView2BrowserHitTransparent --js-flags=--max-old-space-size=512";
 
@@ -23,10 +20,9 @@ pub const WEBVIEW2_RAM_DIET_ARGS: &str =
 /// and disable heavy background CSS animations to conserve GPU/RAM.
 pub const AUTO_ALLOW_AND_PERF_SCRIPT: &str = r#"
 (function() {
-  if (window.__STUDYAPP_MCP_OBSERVER_INSTALLED__) return;
-  window.__STUDYAPP_MCP_OBSERVER_INSTALLED__ = true;
+  if (window.__CONVERGENCE_MCP_OBSERVER_INSTALLED__) return;
+  window.__CONVERGENCE_MCP_OBSERVER_INSTALLED__ = true;
 
-  // Throttle heavy background decorative animations for smooth 60fps WebView2 performance
   const style = document.createElement('style');
   style.textContent = `
     *, *::before, *::after {
@@ -35,7 +31,6 @@ pub const AUTO_ALLOW_AND_PERF_SCRIPT: &str = r#"
   `;
   document.documentElement.appendChild(style);
 
-  // Auto-click 'Allow' / 'Approve' on Composio MCP confirmation cards inside Gemini / AI sessions
   const clickAllowIfNeeded = () => {
     const buttons = document.querySelectorAll('button, [role="button"]');
     for (const btn of buttons) {
@@ -45,7 +40,7 @@ pub const AUTO_ALLOW_AND_PERF_SCRIPT: &str = r#"
         if (
           containerText.includes('Composio') ||
           containerText.includes('MCP') ||
-          containerText.includes('StudyApp') ||
+          containerText.includes('Convergence') ||
           containerText.includes('tool')
         ) {
           btn.click();
@@ -61,11 +56,113 @@ pub const AUTO_ALLOW_AND_PERF_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Tracks the Python MCP Server child process and the Warm-1 Active Docked AI WebView state
+/// Extension trait providing Tauri sidecar resolution (`Command::new_sidecar("mcp-sidecar")`)
+pub trait SidecarCommandExt {
+    fn new_sidecar(name: &str) -> Result<Command, String>;
+}
+
+impl SidecarCommandExt for Command {
+    fn new_sidecar(name: &str) -> Result<Command, String> {
+        let clean = name.trim_start_matches("bin/").trim_start_matches("bin\\");
+        let target_triple = if cfg!(target_os = "windows") {
+            "x86_64-pc-windows-msvc.exe"
+        } else if cfg!(target_os = "macos") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
+        let sidecar_filename = format!("{clean}-{target_triple}");
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                candidates.push(exe_dir.join(&sidecar_filename));
+                candidates.push(exe_dir.join("bin").join(&sidecar_filename));
+                candidates.push(exe_dir.join(if cfg!(target_os = "windows") {
+                    format!("{clean}.exe")
+                } else {
+                    clean.to_string()
+                }));
+            }
+        }
+        candidates.push(PathBuf::from("src-tauri/bin").join(&sidecar_filename));
+        candidates.push(PathBuf::from("bin").join(&sidecar_filename));
+
+        for candidate in candidates {
+            if candidate.exists() {
+                return Ok(Command::new(candidate));
+            }
+        }
+        Ok(Command::new(sidecar_filename))
+    }
+}
+
+/// Resolves the dynamic OS `$APPLOCALDATA` root directory for Convergence.
+/// Uses Tauri v2's `app.path().app_local_data_dir()` when an `AppHandle` is provided,
+/// or resolves via OS environment variables (`CONVERGENCE_APPDATA_DIR` / `LOCALAPPDATA` / `XDG_DATA_HOME`).
+pub fn resolve_app_local_data_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
+    if let Some(handle) = app {
+        if let Ok(dir) = handle.path().app_local_data_dir() {
+            return dir;
+        }
+    }
+    if let Ok(custom) = std::env::var("CONVERGENCE_APPDATA_DIR")
+        .or_else(|_| std::env::var("STUDYAPP_APPDATA_DIR"))
+    {
+        if !custom.trim().is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        if !local_appdata.trim().is_empty() {
+            return PathBuf::from(local_appdata).join("com.convergence.studyapp");
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.trim().is_empty() {
+            return PathBuf::from(xdg).join("com.convergence.studyapp");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("com.convergence.studyapp");
+        }
+    }
+    std::env::temp_dir().join("com.convergence.studyapp")
+}
+
+/// Resolves the persistent WebView profile directory inside `$APPLOCALDATA/.webview_partitions/persist_study_session`.
+pub fn resolve_study_session_partition_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
+    resolve_app_local_data_dir(app)
+        .join(".webview_partitions")
+        .join("persist_study_session")
+}
+
+/// Automatically creates `vault`, `images`, `srs_data`, and `.webview_partitions/persist_study_session`
+/// inside `$APPLOCALDATA` on startup if they are missing.
+pub fn ensure_appdata_subdirs(base_dir: &Path) -> Result<(), String> {
+    for sub in [
+        "vault",
+        "images",
+        "srs_data",
+        ".webview_partitions/persist_study_session",
+    ] {
+        let dir = base_dir.join(sub);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create AppLocalData subdir {:?}: {e}", dir))?;
+    }
+    Ok(())
+}
+
+/// Tracks the bundled MCP Sidecar process, resolved `$APPLOCALDATA` root, and Warm-1 Active Docked AI WebView state
 pub struct AppRuntimeState {
     pub mcp_sidecar: Mutex<Option<Child>>,
     pub active_docked_provider: Mutex<Option<String>>,
     pub detached_providers: Mutex<HashMap<String, String>>,
+    pub app_data_dir: Mutex<PathBuf>,
 }
 
 impl Default for AppRuntimeState {
@@ -74,6 +171,7 @@ impl Default for AppRuntimeState {
             mcp_sidecar: Mutex::new(None),
             active_docked_provider: Mutex::new(None),
             detached_providers: Mutex::new(HashMap::new()),
+            app_data_dir: Mutex::new(resolve_app_local_data_dir(None)),
         }
     }
 }
@@ -88,7 +186,6 @@ pub struct AiPanelStatus {
 }
 
 /// Resolves canonical or custom AI provider identifier + optional custom URL to `(panel_label, float_label, url, title)`.
-/// Supports built-in providers (gemini, chatgpt, claude, notebooklm) AND unlimited user-pinned custom chatbots.
 pub fn resolve_ai_provider_with_url(
     provider: &str,
     custom_url: Option<&str>,
@@ -106,43 +203,43 @@ pub fn resolve_ai_provider_with_url(
     let (default_url, default_title) = match clean_slug.as_str() {
         "gemini" => (
             "https://gemini.google.com/app".to_string(),
-            "Gemini 4 Argon — StudyApp Session".to_string(),
+            "Gemini 4 Argon — Convergence Session".to_string(),
         ),
         "chatgpt" => (
             "https://chatgpt.com/".to_string(),
-            "ChatGPT — StudyApp Session".to_string(),
+            "ChatGPT — Convergence Session".to_string(),
         ),
         "claude" => (
             "https://claude.ai/new".to_string(),
-            "Claude — StudyApp Session".to_string(),
+            "Claude — Convergence Session".to_string(),
         ),
         "notebooklm" => (
             "https://notebooklm.google.com/".to_string(),
-            "NotebookLM — StudyApp Session".to_string(),
+            "NotebookLM — Convergence Session".to_string(),
         ),
         "perplexity" => (
             "https://www.perplexity.ai/".to_string(),
-            "Perplexity — StudyApp Session".to_string(),
+            "Perplexity — Convergence Session".to_string(),
         ),
         "deepseek" => (
             "https://chat.deepseek.com/".to_string(),
-            "DeepSeek — StudyApp Session".to_string(),
+            "DeepSeek — Convergence Session".to_string(),
         ),
         "grok" => (
             "https://grok.com/".to_string(),
-            "Grok — StudyApp Session".to_string(),
+            "Grok — Convergence Session".to_string(),
         ),
         "copilot" => (
             "https://copilot.microsoft.com/".to_string(),
-            "Microsoft Copilot — StudyApp Session".to_string(),
+            "Microsoft Copilot — Convergence Session".to_string(),
         ),
         "poe" => (
             "https://poe.com/".to_string(),
-            "Poe — StudyApp Session".to_string(),
+            "Poe — Convergence Session".to_string(),
         ),
         "mistral" | "lechat" => (
             "https://chat.mistral.ai/".to_string(),
-            "Mistral Le Chat — StudyApp Session".to_string(),
+            "Mistral Le Chat — Convergence Session".to_string(),
         ),
         _ => {
             let fallback = format!(
@@ -151,7 +248,7 @@ pub fn resolve_ai_provider_with_url(
             );
             (
                 fallback,
-                format!("{} — StudyApp AI Session", provider.trim()),
+                format!("{} — Convergence AI Session", provider.trim()),
             )
         }
     };
@@ -174,8 +271,6 @@ pub fn resolve_ai_provider(provider: &str) -> Result<(String, String, String, St
     resolve_ai_provider_with_url(provider, None)
 }
 
-/// Canonicalises `path` even when it does not exist yet by resolving the deepest existing ancestor
-/// (following symlinks / `..`) and re-appending the remaining, already-normalised components.
 fn canonicalize_lenient(path: &Path) -> Result<PathBuf, String> {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path.to_path_buf();
@@ -204,44 +299,48 @@ fn canonicalize_lenient(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Validates that a (relative or absolute) path resolves strictly inside `E:\StudyApp\MyFiles\`.
-/// Relative inputs are joined onto the sandbox root. The path is canonicalised first, so `../`
-/// traversal, symlink escapes and sibling-prefix tricks (`MyFiles_evil`) are all rejected.
-/// Returns the canonical, validated path.
-pub fn enforce_e_drive_sandbox(candidate: &Path) -> Result<PathBuf, String> {
-    let _ = std::fs::create_dir_all(SANDBOX_ROOT);
-    let root = std::fs::canonicalize(SANDBOX_ROOT)
-        .map_err(|e| format!("Sandbox root unavailable: {e}"))?;
+/// Validates that a (relative or absolute) path resolves strictly inside the dynamic `$APPLOCALDATA` sandbox.
+pub fn enforce_appdata_sandbox_with_root(base_dir: &Path, candidate: &Path) -> Result<PathBuf, String> {
+    let _ = std::fs::create_dir_all(base_dir);
+    let root = std::fs::canonicalize(base_dir)
+        .map_err(|e| format!("AppLocalData sandbox root unavailable: {e}"))?;
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        PathBuf::from(SANDBOX_ROOT).join(candidate)
+        base_dir.join(candidate)
     };
     let resolved = canonicalize_lenient(&joined)?;
-    // `Path::starts_with` compares whole components, so `MyFiles_evil` does not match `MyFiles`.
     if resolved.starts_with(&root) {
         Ok(resolved)
     } else {
         Err(format!(
-            "Constitution Violation: Path {:?} is outside the E:\\StudyApp\\MyFiles sandbox.",
-            candidate
+            "Convergence Sandbox Violation: Path {:?} escapes AppLocalData sandbox {:?}",
+            candidate, root
         ))
     }
+}
+
+pub fn enforce_appdata_sandbox(candidate: &Path) -> Result<PathBuf, String> {
+    let base = resolve_app_local_data_dir(None);
+    enforce_appdata_sandbox_with_root(&base, candidate)
 }
 
 /// Embedded canonical schema (MyFiles/srs_data/schema.sql)
 const SCHEMA_SQL: &str = include_str!("../../MyFiles/srs_data/schema.sql");
 
-/// Applies `schema.sql` to `E:\StudyApp\MyFiles\srs_data\studyapp_srs.db` with foreign keys enabled.
-pub fn init_database() -> Result<(), String> {
-    let dir = PathBuf::from(SANDBOX_ROOT).join("srs_data");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create srs_data: {e}"))?;
-    let db_path = enforce_e_drive_sandbox(&dir.join("studyapp_srs.db"))?;
+/// Applies `schema.sql` to `$APPLOCALDATA/srs_data/studyapp_srs.db` with foreign keys enabled.
+pub fn init_database_at(base_dir: &Path) -> Result<PathBuf, String> {
+    ensure_appdata_subdirs(base_dir)?;
+    let dir = base_dir.join("srs_data");
+    let schema_file = dir.join("schema.sql");
+    if !schema_file.exists() {
+        let _ = std::fs::write(&schema_file, SCHEMA_SQL);
+    }
+    let db_path = enforce_appdata_sandbox_with_root(base_dir, &dir.join("studyapp_srs.db"))?;
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
 
-    // Migration: databases created before FSRS-5 lack `srs_cards.learning_step`.
     let has_learning_step: bool = {
         let mut stmt = conn
             .prepare("PRAGMA table_info(srs_cards)")
@@ -261,35 +360,78 @@ pub fn init_database() -> Result<(), String> {
         conn.execute_batch("ALTER TABLE srs_cards ADD COLUMN learning_step INTEGER NOT NULL DEFAULT 0;")
             .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(db_path)
 }
 
-/// Spawns the local Python MCP server (`mcp-server/src/server.py`) on startup
-fn spawn_mcp_sidecar() -> Option<Child> {
-    let server_script = PathBuf::from(r"E:\StudyApp\mcp-server\src\server.py");
-    if !server_script.exists() {
-        return None;
+pub fn init_database() -> Result<(), String> {
+    let base = resolve_app_local_data_dir(None);
+    init_database_at(&base).map(|_| ())
+}
+
+/// Spawns the bundled `mcp-sidecar` binary on startup using `Command::new_sidecar("mcp-sidecar")` bound to port 1420.
+fn spawn_mcp_sidecar(app_data_dir: &Path) -> Option<Child> {
+    if let Ok(mut cmd) = Command::new_sidecar("mcp-sidecar") {
+        cmd.args(["--sidecar", "--port", &MCP_SIDECAR_PORT.to_string()])
+            .env("CONVERGENCE_APPDATA_DIR", app_data_dir)
+            .env("STUDYAPP_APPDATA_DIR", app_data_dir)
+            .env("MCP_SIDECAR_PORT", MCP_SIDECAR_PORT.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(child) = cmd.spawn() {
+            return Some(child);
+        }
     }
-    Command::new("python")
-        .args(["-m", "src.server"])
-        .current_dir(r"E:\StudyApp\mcp-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+
+    // Development fallback if running unbundled from source checkout
+    let dev_server = PathBuf::from("mcp-server/src/server.py");
+    if dev_server.exists() {
+        return Command::new("python3")
+            .args(["-m", "src.server", "--sidecar", "--port", &MCP_SIDECAR_PORT.to_string()])
+            .current_dir("mcp-server")
+            .env("CONVERGENCE_APPDATA_DIR", app_data_dir)
+            .env("STUDYAPP_APPDATA_DIR", app_data_dir)
+            .env("MCP_SIDECAR_PORT", MCP_SIDECAR_PORT.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok();
+    }
+    None
 }
 
-/// Forwards user text selection from the Vault Reader UI to `127.0.0.1:47821/highlight`
+#[tauri::command]
+fn get_mcp_sidecar_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppRuntimeState>,
+) -> Result<serde_json::Value, String> {
+    let app_data_dir = resolve_app_local_data_dir(Some(&app));
+    let running = state
+        .mcp_sidecar
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false);
+    Ok(serde_json::json!({
+        "sidecar": "bin/mcp-sidecar",
+        "running": running,
+        "port": MCP_SIDECAR_PORT,
+        "mcp_url": format!("http://localhost:{}/mcp", MCP_SIDECAR_PORT),
+        "highlight_bridge_url": HIGHLIGHT_BRIDGE_URL,
+        "app_local_data_dir": app_data_dir.to_string_lossy(),
+    }))
+}
+
 #[tauri::command]
 async fn update_active_highlight(
+    app: tauri::AppHandle,
     active_file: String,
     selected_text: String,
     surrounding_context: String,
 ) -> Result<String, String> {
-    // Sandbox gate: reject `../` escapes before the path ever reaches the Python bridge.
-    let validated = enforce_e_drive_sandbox(Path::new(&active_file))?;
-    let root = std::fs::canonicalize(SANDBOX_ROOT).map_err(|e| e.to_string())?;
+    let base_dir = resolve_app_local_data_dir(Some(&app));
+    let validated = enforce_appdata_sandbox_with_root(&base_dir, Path::new(&active_file))?;
+    let root = std::fs::canonicalize(&base_dir).map_err(|e| e.to_string())?;
     let relative_file = validated
         .strip_prefix(&root)
         .map_err(|e| e.to_string())?
@@ -313,13 +455,6 @@ async fn update_active_highlight(
     Ok("synced".to_string())
 }
 
-/// Hot-swaps the active docked AI Web-View inside the `main` window using the Warm-1 RAM Pool.
-///
-/// Each provider owns exactly one native child webview (unique label `ai_panel_<provider>`). Switching
-/// never destroys a webview: the previously docked panel is `hide()`-den (DOM, cookies, and JS state stay
-/// resident) and the target is either `show()`-n (if already warm) or created once. Because panel labels
-/// are looked up before creation, label collisions cannot occur. Cookies/IndexedDB persist in the shared
-/// `E:\StudyApp\MyFiles\.webview_partitions\persist_study_session` profile.
 #[tauri::command]
 fn switch_active_ai_panel(
     app: tauri::AppHandle,
@@ -334,14 +469,13 @@ fn switch_active_ai_panel(
     let norm_provider = provider.to_lowercase();
     let (panel_label, float_label, target_url, _title) =
         resolve_ai_provider_with_url(&norm_provider, target_url.as_deref())?;
+    let partition_dir = resolve_study_session_partition_dir(Some(&app));
 
-    // Holding this lock for the whole swap serialises concurrent switch/redock requests.
     let mut active_guard = state
         .active_docked_provider
         .lock()
         .map_err(|e| format!("Mutex lock error: {e}"))?;
 
-    // A provider that currently lives in a floating window cannot also be docked: focus the float.
     let is_detached = state
         .detached_providers
         .lock()
@@ -355,12 +489,11 @@ fn switch_active_ai_panel(
                 mode: "detached".to_string(),
                 label: float_label,
                 target_url,
-                partition_dir: STUDY_SESSION_PARTITION_DIR.to_string(),
+                partition_dir: partition_dir.to_string_lossy().to_string(),
             });
         }
     }
 
-    // (a) Fully hide the previously docked webview BEFORE touching the new one.
     if let Some(prev_provider) = active_guard.clone() {
         if prev_provider != norm_provider {
             let (prev_label, _, _, _) = resolve_ai_provider(&prev_provider)?;
@@ -372,7 +505,6 @@ fn switch_active_ai_panel(
         }
     }
 
-    // (b)+(c) Reuse the warm webview if its label exists; only create when absent.
     if let Some(existing) = app.get_webview(&panel_label) {
         existing
             .set_position(LogicalPosition::new(x, y))
@@ -384,8 +516,7 @@ fn switch_active_ai_panel(
             .show()
             .map_err(|e| format!("Failed to show '{panel_label}': {e}"))?;
     } else {
-        let data_dir = PathBuf::from(STUDY_SESSION_PARTITION_DIR);
-        std::fs::create_dir_all(&data_dir)
+        std::fs::create_dir_all(&partition_dir)
             .map_err(|e| format!("Failed to create persist_study_session directory: {e}"))?;
 
         let main_window = app
@@ -397,7 +528,7 @@ fn switch_active_ai_panel(
             .map_err(|e| format!("Invalid provider URL: {e}"))?;
 
         let webview_builder = WebviewBuilder::new(&panel_label, WebviewUrl::External(parsed_url))
-            .data_directory(data_dir)
+            .data_directory(partition_dir.clone())
             .initialization_script(AUTO_ALLOW_AND_PERF_SCRIPT)
             .auto_resize();
 
@@ -410,7 +541,6 @@ fn switch_active_ai_panel(
             .map_err(|e| format!("Failed to mount docked AI webview '{panel_label}': {e}"))?;
     }
 
-    // Only record the new active provider once the mount/show actually succeeded.
     *active_guard = Some(norm_provider.clone());
 
     Ok(AiPanelStatus {
@@ -418,11 +548,10 @@ fn switch_active_ai_panel(
         mode: "docked".to_string(),
         label: panel_label,
         target_url,
-        partition_dir: STUDY_SESSION_PARTITION_DIR.to_string(),
+        partition_dir: partition_dir.to_string_lossy().to_string(),
     })
 }
 
-/// Legacy compatibility alias that delegates to `switch_active_ai_panel`
 #[tauri::command]
 fn mount_persistent_ai_panel(
     app: tauri::AppHandle,
@@ -432,7 +561,7 @@ fn mount_persistent_ai_panel(
     partition_id: String,
 ) -> Result<String, String> {
     if partition_id != "persist:study_session" {
-        return Err("Constitution Directive 3 requires partition_id = 'persist:study_session'".into());
+        return Err("Convergence requires partition_id = 'persist:study_session'".into());
     }
     let inferred = if target_url.contains("chatgpt") || panel_label.contains("chatgpt") {
         "chatgpt"
@@ -444,12 +573,19 @@ fn mount_persistent_ai_panel(
         "gemini"
     };
 
-    let status = switch_active_ai_panel(app, state, inferred.to_string(), 920.0, 56.0, 680.0, 904.0, Some(target_url))?;
+    let status = switch_active_ai_panel(
+        app,
+        state,
+        inferred.to_string(),
+        920.0,
+        56.0,
+        680.0,
+        904.0,
+        Some(target_url),
+    )?;
     Ok(format!("Mounted {} ({}) in mode {}", status.provider, status.label, status.mode))
 }
 
-/// Undocks the specified AI provider from the `main` split-pane and spawns a native floating desktop window
-/// sharing `persist:study_session`.
 #[tauri::command]
 fn detach_ai_panel(
     app: tauri::AppHandle,
@@ -460,14 +596,13 @@ fn detach_ai_panel(
     let norm_provider = provider.to_lowercase();
     let (panel_label, float_label, target_url, title) =
         resolve_ai_provider_with_url(&norm_provider, target_url.as_deref())?;
+    let partition_dir = resolve_study_session_partition_dir(Some(&app));
 
-    // Unmount docked child webview if currently active
     {
         let mut active_guard = state
             .active_docked_provider
             .lock()
             .map_err(|e| format!("Mutex lock error: {e}"))?;
-        // Keep the docked webview warm (hidden) so redock is instant and label reuse is collision-free.
         if let Some(existing_wv) = app.get_webview(&panel_label) {
             existing_wv
                 .hide()
@@ -478,8 +613,7 @@ fn detach_ai_panel(
         }
     }
 
-    let data_dir = PathBuf::from(STUDY_SESSION_PARTITION_DIR);
-    std::fs::create_dir_all(&data_dir)
+    std::fs::create_dir_all(&partition_dir)
         .map_err(|e| format!("Failed to create persist_study_session directory: {e}"))?;
 
     if let Some(existing_win) = app.get_webview_window(&float_label) {
@@ -493,7 +627,7 @@ fn detach_ai_panel(
             .title(&title)
             .inner_size(980.0, 860.0)
             .resizable(true)
-            .data_directory(data_dir)
+            .data_directory(partition_dir.clone())
             .initialization_script(AUTO_ALLOW_AND_PERF_SCRIPT)
             .build()
             .map_err(|e| format!("Failed to spawn floating AI window '{float_label}': {e}"))?;
@@ -512,11 +646,10 @@ fn detach_ai_panel(
         mode: "detached".to_string(),
         label: float_label,
         target_url,
-        partition_dir: STUDY_SESSION_PARTITION_DIR.to_string(),
+        partition_dir: partition_dir.to_string_lossy().to_string(),
     })
 }
 
-/// Closes a detached floating AI window and seamlessly re-docks the provider into the `main` split-pane
 #[tauri::command]
 fn redock_ai_panel(
     app: tauri::AppHandle,
@@ -547,7 +680,6 @@ fn redock_ai_panel(
     switch_active_ai_panel(app, state, norm_provider, x, y, width, height, target_url)
 }
 
-/// Navigates an active docked or floating AI WebView to a new URL or search query inside its mini-browser bar
 #[tauri::command]
 fn navigate_ai_panel(
     app: tauri::AppHandle,
@@ -574,7 +706,6 @@ fn navigate_ai_panel(
     Ok(resolved_url)
 }
 
-/// Syncs the native docked child Web-View bounds whenever the user drags the React split-pane divider
 #[tauri::command]
 fn resize_docked_ai_panel(
     app: tauri::AppHandle,
@@ -604,11 +735,10 @@ fn resize_docked_ai_panel(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Enforce WebView2 RAM Diet & Lag Optimization before initializing Tauri
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", WEBVIEW2_RAM_DIET_ARGS);
-    // E:\ Law: main window and all child WebViews share one E:\ WebView2 profile (never C:\ AppData)
-    let _ = std::fs::create_dir_all(STUDY_SESSION_PARTITION_DIR);
-    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", STUDY_SESSION_PARTITION_DIR);
+    let bootstrap_partition = resolve_study_session_partition_dir(None);
+    let _ = std::fs::create_dir_all(&bootstrap_partition);
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &bootstrap_partition);
 
     tauri::Builder::default()
         .manage(AppRuntimeState::default())
@@ -616,28 +746,23 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .setup(|app| {
-            // Ensure E:\StudyApp\MyFiles sandbox directories exist at startup
-            for sub in [
-                "vault",
-                "images",
-                "srs_data",
-                ".webview_partitions/persist_study_session",
-            ] {
-                let mut dir = PathBuf::from(SANDBOX_ROOT);
-                dir.push(sub);
-                let _ = std::fs::create_dir_all(&dir);
-            }
+            let app_data_dir = resolve_app_local_data_dir(Some(app.handle()));
+            let _ = ensure_appdata_subdirs(&app_data_dir);
 
-            // Build/upgrade the SQLite schema before anything touches the DB
-            if let Err(e) = init_database() {
-                eprintln!("[StudyApp] SQLite schema init failed: {e}");
-            }
-
-            // Spawn Python MCP sidecar server
-            if let Some(child) = spawn_mcp_sidecar() {
+            {
                 let state = app.state::<AppRuntimeState>();
-                let lock_result = state.mcp_sidecar.lock();
-                if let Ok(mut guard) = lock_result {
+                if let Ok(mut dir_guard) = state.app_data_dir.lock() {
+                    *dir_guard = app_data_dir.clone();
+                }
+            }
+
+            if let Err(e) = init_database_at(&app_data_dir) {
+                eprintln!("[Convergence] SQLite schema init failed: {e}");
+            }
+
+            if let Some(child) = spawn_mcp_sidecar(&app_data_dir) {
+                let state = app.state::<AppRuntimeState>();
+                if let Ok(mut guard) = state.mcp_sidecar.lock() {
                     *guard = Some(child);
                 }
             }
@@ -647,22 +772,16 @@ pub fn run() {
             if let Some(provider) = window.label().strip_prefix("ai_float_") {
                 if let tauri::WindowEvent::Destroyed = event {
                     let state = window.state::<AppRuntimeState>();
-                    let removed = match state.detached_providers.lock() {
-                        Ok(mut g) => g.remove(provider).is_some(),
-                        Err(_) => false,
-                    };
-                    let _ = removed;
+                    let _ = state.detached_providers.lock().map(|mut g| g.remove(provider));
                 }
             }
             if window.label() == "main" {
                 if let tauri::WindowEvent::Destroyed = event {
                     let state = window.state::<AppRuntimeState>();
-                    let mut guard = match state.mcp_sidecar.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    if let Some(mut child) = guard.take() {
-                        let _ = child.kill();
+                    if let Ok(mut guard) = state.mcp_sidecar.lock() {
+                        if let Some(mut child) = guard.take() {
+                            let _ = child.kill();
+                        }
                     }
                 }
             }
@@ -675,9 +794,10 @@ pub fn run() {
             resize_docked_ai_panel,
             navigate_ai_panel,
             update_active_highlight,
+            get_mcp_sidecar_status,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running StudyApp tauri application");
+        .expect("error while running Convergence tauri application");
 }
 
 #[cfg(test)]
@@ -685,16 +805,18 @@ mod sandbox_tests {
     use super::*;
 
     #[test]
-    fn accepts_paths_inside_sandbox() {
-        assert!(enforce_e_drive_sandbox(Path::new("vault/note.md")).is_ok());
-        assert!(enforce_e_drive_sandbox(Path::new(r"E:\StudyApp\MyFiles\srs_data\studyapp_srs.db")).is_ok());
+    fn accepts_paths_inside_appdata_sandbox() {
+        let base = resolve_app_local_data_dir(None);
+        let _ = ensure_appdata_subdirs(&base);
+        assert!(enforce_appdata_sandbox_with_root(&base, Path::new("vault/note.md")).is_ok());
+        assert!(enforce_appdata_sandbox_with_root(&base, &base.join("srs_data/studyapp_srs.db")).is_ok());
     }
 
     #[test]
     fn rejects_traversal_and_foreign_paths() {
-        assert!(enforce_e_drive_sandbox(Path::new("../secrets.txt")).is_err());
-        assert!(enforce_e_drive_sandbox(Path::new("vault/../../outside.md")).is_err());
-        assert!(enforce_e_drive_sandbox(Path::new(r"C:\Windows\win.ini")).is_err());
-        assert!(enforce_e_drive_sandbox(Path::new(r"E:\StudyApp\MyFiles_evil\x.md")).is_err());
+        let base = resolve_app_local_data_dir(None);
+        let _ = ensure_appdata_subdirs(&base);
+        assert!(enforce_appdata_sandbox_with_root(&base, Path::new("../secrets.txt")).is_err());
+        assert!(enforce_appdata_sandbox_with_root(&base, Path::new("vault/../../outside.md")).is_err());
     }
 }

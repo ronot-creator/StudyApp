@@ -506,7 +506,7 @@ export const FsrsRunner: React.FC = () => {
                       </strong>
                       <p style={{ margin: "6px 0 0 0", fontSize: "12.5px", color: "#cbd5e1" }}>
                         Your physiological response was saved to <code>grading_queue</code> in{" "}
-                        <code>E:\StudyApp\MyFiles\srs_data\studyapp_srs.db</code> and will be graded
+                        <code>$APPLOCALDATA/srs_data/studyapp_srs.db</code> and will be graded
                         oldest-first automatically once the Ngrok tunnel reconnects.
                       </p>
                     </div>

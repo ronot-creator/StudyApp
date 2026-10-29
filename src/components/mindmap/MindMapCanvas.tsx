@@ -15,7 +15,9 @@ import {
   Connection,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { readTextFile, writeTextFile, mkdir, BaseDirectory } from "@tauri-apps/plugin-fs";
+import { appLocalDataDir, join } from "@tauri-apps/api/path";
+import { ensureAppDataDirectories, resolveAppDataSubPath } from "../../lib/appPaths";
 import Database from "@tauri-apps/plugin-sql";
 import { CANONICAL_ORGAN_SYSTEMS, OrganSystem } from "../../types/study";
 import { getNgrokGrader, SQLITE_DB_URI } from "../../services/ngrokGrader";
@@ -138,11 +140,22 @@ export function getSafeVaultFilename(organSystem: OrganSystem): string {
   return organSystem.replace(/[^A-Za-z0-9_-]+/g, "_");
 }
 
+export async function resolveDynamicVaultNotePath(organSystem: OrganSystem): Promise<string> {
+  const safeName = getSafeVaultFilename(organSystem);
+  try {
+    const base = await appLocalDataDir();
+    return await join(base, "vault", `${safeName}.md`);
+  } catch {
+    return resolveAppDataSubPath("vault", `${safeName}.md`);
+  }
+}
+
 export async function readOrganSystemVaultMarkdown(organSystem: OrganSystem): Promise<string> {
   const safeName = getSafeVaultFilename(organSystem);
-  const vaultFilePath = `E:\\StudyApp\\MyFiles\\vault\\${safeName}.md`;
+  const relVaultPath = `vault/${safeName}.md`;
   try {
-    const diskText = await readTextFile(vaultFilePath);
+    await ensureAppDataDirectories();
+    const diskText = await readTextFile(relVaultPath, { baseDir: BaseDirectory.AppLocalData });
     if (diskText && diskText.trim().length > 0) {
       try {
         localStorage.setItem(`${VAULT_STORAGE_PREFIX}${organSystem}`, diskText);
@@ -152,7 +165,15 @@ export async function readOrganSystemVaultMarkdown(organSystem: OrganSystem): Pr
       return diskText;
     }
   } catch {
-    // Fallback to localStorage or built-in system markdown
+    try {
+      const fullPath = await resolveDynamicVaultNotePath(organSystem);
+      const diskText = await readTextFile(fullPath);
+      if (diskText && diskText.trim().length > 0) {
+        return diskText;
+      }
+    } catch {
+      // Fallback to localStorage or built-in system markdown
+    }
   }
 
   try {
@@ -178,11 +199,17 @@ export async function writeOrganSystemVaultMarkdown(
   }
 
   const safeName = getSafeVaultFilename(organSystem);
-  const vaultFilePath = `E:\\StudyApp\\MyFiles\\vault\\${safeName}.md`;
+  const relVaultPath = `vault/${safeName}.md`;
   try {
-    await writeTextFile(vaultFilePath, markdownContent);
+    await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
+    await writeTextFile(relVaultPath, markdownContent, { baseDir: BaseDirectory.AppLocalData });
   } catch {
-    // Safe fallback in browser preview
+    try {
+      const fullPath = await resolveDynamicVaultNotePath(organSystem);
+      await writeTextFile(fullPath, markdownContent);
+    } catch {
+      // Safe fallback in browser preview
+    }
   }
 }
 
@@ -834,7 +861,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       <div className="liquid-card" style={{ padding: "12px 16px" }}>
         <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "8px" }}>
           Add Physiological Causal Link (auto-appends to <code>```mindmap</code> block in{" "}
-          <code>E:\StudyApp\MyFiles\vault\{getSafeVaultFilename(activeSystem)}.md</code>)
+          <code>$APPLOCALDATA/vault/{getSafeVaultFilename(activeSystem)}.md</code>)
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1.6fr 1.2fr 1fr auto", gap: "8px" }}>
           <input
@@ -993,7 +1020,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
 
       <div className="liquid-card">
         <label style={{ display: "block", fontSize: "12px", color: "#94a3b8", marginBottom: "6px" }}>
-          Dual-Syntax Vault Note (<code>E:\StudyApp\MyFiles\vault\{getSafeVaultFilename(activeSystem)}.md</code> — only{" "}
+          Dual-Syntax Vault Note (<code>$APPLOCALDATA/vault/{getSafeVaultFilename(activeSystem)}.md</code> — only{" "}
           <code>```mindmap</code> blocks are parsed into graph nodes)
         </label>
         <textarea

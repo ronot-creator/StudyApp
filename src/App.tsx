@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
-import "./styles/liquid-glass.css";
 import {
   AiProviderConfig,
   AiProviderId,
@@ -12,6 +11,8 @@ import { TunnelStatus } from "./components/TunnelStatus";
 import { VaultReader } from "./components/vault/VaultReader";
 import { FsrsRunner } from "./components/srs/FsrsRunner";
 import { MindMapCanvas } from "./components/mindmap/MindMapCanvas";
+import { AiIntegrations } from "./components/settings/AiIntegrations";
+import { ensureAppDataDirectories, resolveAppLocalDataRoot } from "./lib/appPaths";
 import { createSrsCard } from "./lib/fsrs";
 import {
   DEFAULT_CURATED_REPOSITORIES,
@@ -27,7 +28,7 @@ import {
   resolveChatbotSearchCandidates,
 } from "./services/aiProviderRegistry";
 
-type WorkspaceTab = "vault" | "srs" | "mindmap" | "specimens";
+type WorkspaceTab = "vault" | "srs" | "mindmap" | "specimens" | "integrations";
 
 export const MAX_INLINE_PINNED_AI_TABS = 4;
 
@@ -75,6 +76,12 @@ export default function App() {
   const [sourcedAssets, setSourcedAssets] = useState<SourcedMedicalAsset[]>([]);
   const [isSourcing, setIsSourcing] = useState<boolean>(false);
   const [dbToast, setDbToast] = useState<string | null>(null);
+  const [appDataRoot, setAppDataRoot] = useState<string>("$APPLOCALDATA");
+
+  useEffect(() => {
+    void ensureAppDataDirectories().then((dir) => setAppDataRoot(dir));
+    void resolveAppLocalDataRoot().then((dir) => setAppDataRoot(dir));
+  }, []);
 
   useEffect(() => {
     specimenSourcingService.onPersistError = (msg) => {
@@ -371,9 +378,9 @@ export default function App() {
       <header className="liquid-topbar">
         <div className="liquid-brand">
           <span style={{ fontWeight: 700, fontSize: "16px", color: "#f8fafc" }}>
-            StudyApp
+            Convergence
           </span>
-          <span className="liquid-brand-badge">E:\StudyApp\MyFiles Sandbox</span>
+          <span className="liquid-brand-badge" title={appDataRoot}>$APPLOCALDATA Sandbox</span>
         </div>
 
         <nav className="liquid-nav-tabs">
@@ -401,6 +408,12 @@ export default function App() {
           >
             4. Specimen &amp; 3D Sourcing
           </button>
+          <button
+            className={`liquid-tab-btn ${activeTab === "integrations" ? "active" : ""}`}
+            onClick={() => setActiveTab("integrations")}
+          >
+            5. AI Integrations (MCP)
+          </button>
         </nav>
 
         <TunnelStatus />
@@ -427,6 +440,10 @@ export default function App() {
               organSystem={mindMapSystem}
               onOrganSystemChange={setMindMapSystem}
             />
+          )}
+
+          {activeTab === "integrations" && (
+            <AiIntegrations appDataRoot={appDataRoot} />
           )}
 
           {activeTab === "specimens" && (
@@ -532,7 +549,7 @@ export default function App() {
                                 frontPrompt: `Identify the occluded anatomical structures on ${a.descriptiveFilename} (${a.organSystem}):`,
                                 markScheme: a.occlusionBoxes.map((b) => b.label_text).join(" | "),
                                 imageId: a.id,
-                                imagePath: `E:/StudyApp/MyFiles/images/${a.descriptiveFilename}`,
+                                imagePath: `${appDataRoot.replace(/\\/g, "/")}/images/${a.descriptiveFilename}`,
                                 occlusionBoxesJson: JSON.stringify(a.occlusionBoxes),
                                 stability: 0,
                                 difficulty: 5.0,
@@ -558,7 +575,7 @@ export default function App() {
 
               <div className="liquid-card">
                 <h4 style={{ margin: "0 0 10px 0", fontSize: "13px", color: "#94a3b8" }}>
-                  Active Curated Repositories (<code>E:\StudyApp\MyFiles\vault\curated_medical_sources.json</code>)
+                  Active Curated Repositories (<code>{appDataRoot}/vault/curated_medical_sources.json</code>)
                 </h4>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
                   {DEFAULT_CURATED_REPOSITORIES.map((repo) => (
@@ -683,7 +700,7 @@ export default function App() {
                 fontSize: "10.5px",
                 whiteSpace: "nowrap",
               }}
-              title="All OAuth logins & session cookies persist in E:\StudyApp\MyFiles\.webview_partitions\persist_study_session"
+              title={`All OAuth logins & session cookies persist in ${appDataRoot}/.webview_partitions/persist_study_session`}
             >
               🔒 persist:study_session
             </span>
@@ -830,7 +847,7 @@ export default function App() {
                 Pinned Chatbots: <strong>{aiProviders.length}</strong> (Unlimited Capacity)
               </div>
               <div style={{ fontSize: "11.5px", color: "#64748b" }}>
-                Partition: <code>E:\StudyApp\MyFiles\.webview_partitions\persist_study_session</code>
+                Partition: <code>{appDataRoot}/.webview_partitions/persist_study_session</code>
                 <br />
                 Zero <code>&lt;iframe&gt;</code> tags • Persistent OAuth Cookies • Auto-Allow MCP MutationObserver Active
               </div>

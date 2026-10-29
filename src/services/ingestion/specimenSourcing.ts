@@ -1,3 +1,4 @@
+import { ensureAppDataDirectories, resolveAppDataSubPath } from "../../lib/appPaths";
 import Database from "@tauri-apps/plugin-sql";
 import { OrganSystem, OcclusionBox } from "../../types/study";
 import { getNgrokGrader, SQLITE_DB_URI } from "../ngrokGrader";
@@ -32,7 +33,7 @@ export interface SourcedMedicalAsset {
 }
 
 // Use BaseDirectory.AppData as the base, with the sandbox path relative to it
-// The capabilities file grants access to E:/StudyApp/MyFiles
+// The capabilities file grants access to $APPLOCALDATA
 const CURATED_SOURCES_REL_PATH = "vault/curated_medical_sources.json";
 const IMAGES_REL_DIR = "images";
 
@@ -201,6 +202,9 @@ export class SpecimenSourcingService {
   ): Promise<SourcedMedicalAsset[]> {
     const repositories = await loadCuratedRepositories();
     const relevantRepos = repositories.filter((r) => r.modality_focus.includes(modality));
+    await ensureAppDataDirectories();
+    const dynamicImagesDir = await resolveAppDataSubPath('images');
+    void dynamicImagesDir;
     const results: SourcedMedicalAsset[] = [];
 
     for (const repo of relevantRepos) {
@@ -281,7 +285,7 @@ export class SpecimenSourcingService {
         <circle cx="200" cy="155" r="78" fill="rgba(56,189,248,0.12)" stroke="#38bdf8" stroke-width="2"/>
         <path d="M 80 120 Q 140 135 190 140 M 210 170 Q 270 180 340 205 M 280 95 L 490 95 M 280 225 L 510 225" stroke="#818cf8" stroke-width="2.5" fill="none"/>
         <text x="24" y="36" fill="#38bdf8" font-family="sans-serif" font-size="15" font-weight="bold">${organSystem} — ${anatomicalQuery.replace(/[<>&"']/g, "")}</text>
-        <text x="24" y="58" fill="#94a3b8" font-family="sans-serif" font-size="12">Modality: ${modality} | Sandbox File: E:\\StudyApp\\MyFiles\\${localPath.replace(/\//g, "\\")}</text>
+        <text x="24" y="58" fill="#94a3b8" font-family="sans-serif" font-size="12">Modality: ${modality} | Sandbox File: $APPLOCALDATA/${localPath.replace(/\//g, "\\")}</text>
       </svg>`;
       const svgDataUri = `data:image/svg+xml;utf8,${encodeURIComponent(svgDiagram)}`;
 

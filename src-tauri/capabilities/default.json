@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for StudyApp main shell and unlimited persistent study_session native AI WebViews on E:\\StudyApp\\MyFiles\\",
+  "description": "Capabilities for Convergence main shell, MCP sidecar, and unlimited persistent study_session native AI WebViews scoped to $APPLOCALDATA/**",
   "windows": [
     "main",
     "ai_panel_*",
@@ -22,6 +22,8 @@
   ],
   "permissions": [
     "core:default",
+    "core:path:default",
+    "path:default",
     "core:window:default",
     "core:window:create",
     "core:window:allow-create",
@@ -45,12 +47,15 @@
     "navigate_ai_panel",
     "mount_persistent_ai_panel",
     "update_active_highlight",
+    "get_mcp_sidecar_status",
     "shell:allow-open",
     "shell:allow-execute",
+    "shell:allow-spawn",
     "sql:default",
     "sql:allow-execute",
     "sql:allow-select",
     "fs:default",
+    "fs:allow-app-local-data-recursive",
     "fs:allow-read-text-file",
     "fs:allow-write-text-file",
     "fs:allow-read-file",
@@ -61,16 +66,10 @@
       "identifier": "fs:scope",
       "allow": [
         {
-          "path": "E:/StudyApp/MyFiles"
+          "path": "$APPLOCALDATA"
         },
         {
-          "path": "E:/StudyApp/MyFiles/**"
-        },
-        {
-          "path": "E:\\StudyApp\\MyFiles"
-        },
-        {
-          "path": "E:\\StudyApp\\MyFiles\\**"
+          "path": "$APPLOCALDATA/**"
         }
       ]
     }

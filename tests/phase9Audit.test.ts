@@ -311,6 +311,7 @@ describe("Phase 9 Adversarial Audit: 10 Rigorous Functional Tests + 6 Penalty Re
     expect(libRs).toContain("fn navigate_ai_panel");
     expect(libRs).toContain("fn resolve_ai_provider_with_url");
     expect(libRs).toContain("persist_study_session");
+    expect(libRs).toContain("resolve_app_local_data_dir");
   });
 
   it("Test 16 (Apple iOS 26 Liquid Glass SVG Refraction & Constitution CSS Verification): verifies SVG filter and Section 4.2 tokens", () => {
@@ -319,7 +320,7 @@ describe("Phase 9 Adversarial Audit: 10 Rigorous Functional Tests + 6 Penalty Re
     expect(appTsx).toContain("feDisplacementMap");
     expect(appTsx).toContain("feSpecularLighting");
 
-    const css = fs.readFileSync(path.resolve(process.cwd(), "src/styles/liquid-glass.css"), "utf-8");
+    const css = fs.readFileSync(path.resolve(process.cwd(), "src/index.css"), "utf-8");
     expect(css).toContain("--glass-bg-base: rgba(15, 23, 42, 0.45)");
     expect(css).toContain("--glass-blur-standard: blur(16px) saturate(180%)");
     expect(css).toContain("--apple-liquid-refraction: url(#apple-liquid-glass)");

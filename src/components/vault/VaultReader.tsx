@@ -1,10 +1,17 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Database from "@tauri-apps/plugin-sql";
 import ReactMarkdown from "react-markdown";
+import { Editor, rootCtx, defaultValueCtx } from "@milkdown/core";
+import { Milkdown, MilkdownProvider, useEditor } from "@milkdown/react";
+import { commonmark } from "@milkdown/preset-commonmark";
+import { gfm } from "@milkdown/preset-gfm";
+import { math } from "@milkdown/plugin-math";
+import { listener, listenerCtx } from "@milkdown/plugin-listener";
 import { CANONICAL_ORGAN_SYSTEMS, OrganSystem, SrsCard } from "../../types/study";
 import { SQLITE_DB_URI } from "../../services/ngrokGrader";
 import { createSrsCard } from "../../lib/fsrs";
+import { resolveAppDataSubPath } from "../../lib/appPaths";
 import {
   appendTripleToVaultMarkdown,
   DEFAULT_SYSTEM_VAULT_MARKDOWN,
@@ -25,11 +32,16 @@ export const DEFAULT_VAULT_NOTES: VaultNoteFile[] = CANONICAL_ORGAN_SYSTEMS.map(
   content: DEFAULT_SYSTEM_VAULT_MARKDOWN[sys],
 }));
 
+/**
+ * Extracts all Phase 9 thought-anchor formats:
+ * 1. `<!-- thought-anchor:id --> ... <!-- /thought-anchor:id -->`
+ * 2. `<!-- ANCHOR: id | text -->`
+ * 3. `[? ... ?]` single-line and multi-line Thought Anchors
+ */
 export function parseThoughtAnchors(markdownContent: string): Array<{ id: string; text: string }> {
   const extracted: Array<{ id: string; text: string }> = [];
   let match: RegExpExecArray | null;
 
-  // 1. Original margin-note block format: <!-- thought-anchor:id --> ... <!-- /thought-anchor:id -->
   const anchorRegex =
     /<!-- thought-anchor:([^\s>]+) -->\s*> \*\*\[AI Margin Note #[^\]]+\]:?\*\*:?\s*([\s\S]*?)\s*<!-- \/thought-anchor:\1 -->/g;
   while ((match = anchorRegex.exec(markdownContent)) !== null) {
@@ -41,13 +53,11 @@ export function parseThoughtAnchors(markdownContent: string): Array<{ id: string
     extracted.push({ id: match[1], text: cleanText });
   }
 
-  // 2. Inline HTML comment format: <!-- ANCHOR: id | text -->
   const commentRegex = /<!--\s*ANCHOR:\s*([^|>]+?)\s*\|\s*([\s\S]*?)\s*-->/g;
   while ((match = commentRegex.exec(markdownContent)) !== null) {
     extracted.push({ id: match[1].trim(), text: match[2].trim() });
   }
 
-  // 3. Constitution [? ... ?] single and multi-line Thought Anchors
   const bracketRegex = /\[\?\s*([\s\S]*?)\s*\?\]/g;
   let idx = 0;
   while ((match = bracketRegex.exec(markdownContent)) !== null) {
@@ -61,6 +71,98 @@ export function parseThoughtAnchors(markdownContent: string): Array<{ id: string
   return extracted;
 }
 
+/**
+ * Ensures custom syntax blocks (` ```mindmap ... ``` `, `<!-- thought-anchor:... -->`,
+ * `<!-- ANCHOR: ... -->`, and `[? ... ?]`) are preserved losslessly when Milkdown serializes Markdown.
+ */
+export function preserveSpecialMarkdownBlocks(
+  previousMarkdown: string,
+  serializedMarkdown: string
+): string {
+  let output = serializedMarkdown;
+
+  // Preserve ```mindmap code blocks if the serializer altered or omitted them
+  const mindmapBlockRegex = /```mindmap\s*[\s\S]*?```/gi;
+  const prevMindmapBlocks = previousMarkdown.match(mindmapBlockRegex) ?? [];
+  for (const block of prevMindmapBlocks) {
+    if (!output.includes("```mindmap")) {
+      output = `${output.trim()}\n\n${block}\n`;
+    }
+  }
+
+  // Preserve <!-- thought-anchor:... --> blocks if HTML comments were stripped during WYSIWYG edit
+  const taBlockRegex = /<!-- thought-anchor:([^\s>]+) -->[\s\S]*?<!-- \/thought-anchor:\1 -->/g;
+  const prevTaBlocks = previousMarkdown.match(taBlockRegex) ?? [];
+  for (const block of prevTaBlocks) {
+    const idMatch = block.match(/<!-- thought-anchor:([^\s>]+) -->/);
+    if (idMatch && !output.includes(`<!-- thought-anchor:${idMatch[1]} -->`)) {
+      output = `${output.trim()}\n\n${block}\n`;
+    }
+  }
+
+  return output;
+}
+
+export interface ReactEditorProps {
+  editorKey: string;
+  initialMarkdown: string;
+  onChange: (nextMarkdown: string) => void;
+}
+
+/**
+ * Milkdown WYSIWYG ReactEditor component configured with CommonMark, GFM, Math, and Markdown listener.
+ */
+export const ReactEditor: React.FC<ReactEditorProps> = ({
+  editorKey,
+  initialMarkdown,
+  onChange,
+}) => {
+  const latestMarkdownRef = useRef<string>(initialMarkdown);
+  latestMarkdownRef.current = initialMarkdown;
+
+  useEditor(
+    (root) =>
+      Editor.make()
+        .config((ctx) => {
+          ctx.set(rootCtx, root);
+          ctx.set(defaultValueCtx, initialMarkdown);
+          ctx.get(listenerCtx).markdownUpdated((_ctx, markdown, prevMarkdown) => {
+            if (markdown !== prevMarkdown) {
+              const merged = preserveSpecialMarkdownBlocks(
+                latestMarkdownRef.current,
+                markdown
+              );
+              latestMarkdownRef.current = merged;
+              onChange(merged);
+            }
+          });
+        })
+        .use(commonmark)
+        .use(gfm)
+        .use(math)
+        .use(listener),
+    [editorKey]
+  );
+
+  return (
+    <div
+      className="milkdown-wysiwyg-surface"
+      data-testid="milkdown-wysiwyg-editor"
+      style={{
+        minHeight: "300px",
+        padding: "14px 16px",
+        borderRadius: "12px",
+        background: "rgba(9, 15, 29, 0.58)",
+        border: "1px solid rgba(56, 189, 248, 0.28)",
+        color: "#f8fafc",
+        outline: "none",
+      }}
+    >
+      <Milkdown />
+    </div>
+  );
+};
+
 interface VaultReaderProps {
   onPromoteToMindMapNode?: (organSystem: OrganSystem, selectedLabel: string) => void;
   onCreateFsrsCardFromHighlight?: (organSystem: OrganSystem, excerpt: string) => void;
@@ -72,21 +174,31 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
 }) => {
   const [activeSystem, setActiveSystem] = useState<OrganSystem>("Renal");
   const [content, setContent] = useState<string>(DEFAULT_SYSTEM_VAULT_MARKDOWN.Renal);
-  const [viewMode, setViewMode] = useState<"rendered" | "raw">("rendered");
+  const [editorEpoch, setEditorEpoch] = useState<number>(0);
+  const [viewMode, setViewMode] = useState<"wysiwyg" | "rendered">("wysiwyg");
   const [selectedText, setSelectedText] = useState<string>("");
   const [highlightSyncStatus, setHighlightSyncStatus] = useState<string>("Idle");
   const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [actionToast, setActionToast] = useState<string | null>(null);
   const [anchorExplanation, setAnchorExplanation] = useState<string>("");
+  const [resolvedVaultPath, setResolvedVaultPath] = useState<string>(
+    "$APPLOCALDATA/vault/Renal.md"
+  );
 
   const activeFilename = `vault/${getSafeVaultFilename(activeSystem)}.md`;
 
   useEffect(() => {
     let cancelled = false;
     const loadNote = async () => {
+      const fullPath = await resolveAppDataSubPath(
+        "vault",
+        `${getSafeVaultFilename(activeSystem)}.md`
+      );
       const loaded = await readOrganSystemVaultMarkdown(activeSystem);
       if (!cancelled) {
+        setResolvedVaultPath(fullPath);
         setContent(loaded);
+        setEditorEpoch((n) => n + 1);
       }
     };
     void loadNote();
@@ -138,6 +250,7 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
     const tripleLine = `[${activeSystem} Core Concept] --(regulates physiological mechanism of)--> [${cleanNode}]`;
     const updatedMarkdown = appendTripleToVaultMarkdown(content, tripleLine);
     await handleContentUpdate(updatedMarkdown);
+    setEditorEpoch((n) => n + 1);
 
     try {
       const db = await Database.load(SQLITE_DB_URI);
@@ -187,6 +300,7 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
       `High-yield clinical correlation for "${selectedText.slice(0, 60) || activeSystem}": verify autoregulatory feedback and downstream end-organ perfusion.`;
     const anchorBlock = `\n\n<!-- thought-anchor:${anchorId} -->\n> **[AI Margin Note #${anchorId}]:** ${bodyText}\n<!-- /thought-anchor:${anchorId} -->`;
     await handleContentUpdate(`${content.trim()}${anchorBlock}\n`);
+    setEditorEpoch((n) => n + 1);
     setAnchorExplanation("");
     setActionToast(`Inserted Thought Anchor #${anchorId} into ${activeFilename}`);
   };
@@ -218,16 +332,16 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
           </select>
 
           <button
+            className={`liquid-tab-btn ${viewMode === "wysiwyg" ? "active" : ""}`}
+            onClick={() => setViewMode("wysiwyg")}
+          >
+            Milkdown WYSIWYG Editor
+          </button>
+          <button
             className={`liquid-tab-btn ${viewMode === "rendered" ? "active" : ""}`}
             onClick={() => setViewMode("rendered")}
           >
-            Rendered Reader
-          </button>
-          <button
-            className={`liquid-tab-btn ${viewMode === "raw" ? "active" : ""}`}
-            onClick={() => setViewMode("raw")}
-          >
-            Dual-Syntax Editor
+            Read-Only Preview
           </button>
         </div>
         <span style={{ fontSize: "11.5px", color: "#38bdf8" }}>{highlightSyncStatus}</span>
@@ -280,21 +394,24 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
         style={{ lineHeight: 1.7, fontSize: "14px", userSelect: "text" }}
       >
         <div style={{ fontSize: "11.5px", color: "#94a3b8", marginBottom: "10px" }}>
-          <code>E:\StudyApp\MyFiles\{activeFilename}</code> — Highlight text to sync with MCP{" "}
-          <code>get_active_highlight()</code> or right-click for instant promotion.
+          <code>{resolvedVaultPath}</code> — Milkdown WYSIWYG Live Markdown (preserves{" "}
+          <code>```mindmap</code> code blocks &amp; <code>thought-anchor</code> syntax).
         </div>
 
-        {viewMode === "rendered" ? (
+        {viewMode === "wysiwyg" ? (
+          <MilkdownProvider>
+            <ReactEditor
+              editorKey={`${activeSystem}_${editorEpoch}`}
+              initialMarkdown={content}
+              onChange={(nextMarkdown) => {
+                void handleContentUpdate(nextMarkdown);
+              }}
+            />
+          </MilkdownProvider>
+        ) : (
           <div style={{ color: "#f8fafc" }}>
             <ReactMarkdown>{content}</ReactMarkdown>
           </div>
-        ) : (
-          <textarea
-            className="liquid-textarea"
-            rows={12}
-            value={content}
-            onChange={(e) => void handleContentUpdate(e.target.value)}
-          />
         )}
       </div>
 
@@ -306,35 +423,36 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
           <div style={{ display: "flex", gap: "8px", flex: 1, maxWidth: "520px" }}>
             <input
               className="liquid-input"
-              placeholder="Add clinical margin note for current selection or note..."
               value={anchorExplanation}
               onChange={(e) => setAnchorExplanation(e.target.value)}
+              placeholder="Add margin note for selected text (or click + Anchor)..."
             />
             <button className="liquid-btn" onClick={() => void handleInsertThoughtAnchor()}>
-              + Anchor Note
+              + Anchor
             </button>
           </div>
         </div>
         {extractedAnchors.length === 0 ? (
-          <div style={{ fontSize: "12px", color: "#64748b" }}>
-            No inline thought anchors in this document yet. Add one above or via MCP{" "}
-            <code>save_thought_anchor()</code>.
-          </div>
+          <p style={{ margin: 0, fontSize: "12.5px", color: "#94a3b8" }}>
+            No Thought Anchors in this note yet. Highlight text or type an explanation above and click + Anchor.
+          </p>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {extractedAnchors.map((a) => (
               <div
                 key={a.id}
-                className="liquid-interactive-tile"
                 style={{
                   padding: "10px 12px",
-                  borderRadius: "9px",
-                  background: "rgba(56, 189, 248, 0.1)",
+                  borderRadius: "10px",
+                  background: "rgba(56, 189, 248, 0.08)",
                   borderLeft: "3px solid #38bdf8",
-                  fontSize: "13px",
+                  fontSize: "12.5px",
                 }}
               >
-                <strong>#{a.id}:</strong> {a.text}
+                <div style={{ fontWeight: 600, color: "#38bdf8", marginBottom: "4px" }}>
+                  Anchor #{a.id}
+                </div>
+                <div style={{ color: "#e2e8f0" }}>{a.text}</div>
               </div>
             ))}
           </div>
@@ -343,14 +461,27 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
 
       {contextMenuPos && (
         <div
-          className="liquid-context-menu"
-          style={{ left: `${contextMenuPos.x}px`, top: `${contextMenuPos.y}px` }}
+          className="liquid-card"
+          style={{
+            position: "fixed",
+            top: contextMenuPos.y,
+            left: contextMenuPos.x,
+            zIndex: 100,
+            padding: "8px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "6px",
+            minWidth: "220px",
+          }}
         >
-          <button className="liquid-context-item" onClick={() => void promoteSelectionToNode()}>
+          <button className="liquid-btn" onClick={() => void promoteSelectionToNode()}>
             🧠 Promote Selection to Mind Map Node
           </button>
-          <button className="liquid-context-item" onClick={() => void createSecondOrderCard()}>
+          <button className="liquid-btn" onClick={() => void createSecondOrderCard()}>
             🃏 Create 2nd-Order FSRS Card
+          </button>
+          <button className="liquid-btn" onClick={() => void handleInsertThoughtAnchor()}>
+            📌 Insert Thought Anchor Below Paragraph
           </button>
         </div>
       )}

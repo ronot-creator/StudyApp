@@ -1,13 +1,15 @@
 """
-StudyApp Local MCP Server (The Local Bridge)
-Implements the 5 tool schemas specified in Constitution.md Section 6, plus a
-loopback-only HTTP bridge (127.0.0.1:47821) the Tauri shell uses to push highlight state.
+Convergence Local MCP Sidecar Server (The Local Bridge)
+Dynamically targets OS $APPLOCALDATA (vault, images, srs_data) and exposes the 5 MCP tools
+plus HTTP/MCP endpoints on localhost:1420/mcp and 127.0.0.1:47821/highlight.
 """
+import argparse
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,17 +31,28 @@ except ImportError:
             def run(self):
                 pass
 
-from . import sandbox as _sandbox
-from .sandbox import (
-    resolve_sandboxed_path,
-    check_disk_quota,
-    safe_write_text,
-)
+try:
+    from . import sandbox as _sandbox
+    from .sandbox import (
+        resolve_sandboxed_path,
+        check_disk_quota,
+        safe_write_text,
+        ensure_appdata_directories,
+    )
+except ImportError:
+    import src.sandbox as _sandbox  # type: ignore[no-redef]
+    from src.sandbox import (  # type: ignore[no-redef]
+        resolve_sandboxed_path,
+        check_disk_quota,
+        safe_write_text,
+        ensure_appdata_directories,
+    )
 
-mcp = FastMCP("StudyApp-Local-Bridge")
+mcp = FastMCP("Convergence-Local-Bridge")
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = int(os.environ.get("STUDYAPP_BRIDGE_PORT", "47821"))
+SIDECAR_PORT = int(os.environ.get("MCP_SIDECAR_PORT", "1420"))
 _MAX_BODY_BYTES = 1024 * 1024
 
 _STATE_LOCK = threading.Lock()
@@ -52,8 +65,9 @@ _HIGHLIGHT_KEYS = tuple(_ACTIVE_HIGHLIGHT_STATE)
 
 
 def _db() -> sqlite3.Connection:
-    """Opens studyapp_srs.db, creating it from schema.sql on first use."""
-    srs_dir = Path(getattr(_sandbox, "SRS_DATA_DIR", _sandbox.SANDBOX_ROOT / "srs_data"))
+    """Opens studyapp_srs.db inside $APPLOCALDATA/srs_data, creating it from schema.sql on first use."""
+    ensure_appdata_directories(_sandbox.SANDBOX_ROOT)
+    srs_dir = Path(getattr(_sandbox, "SRS_DATA_DIR", Path(_sandbox.SANDBOX_ROOT) / "srs_data"))
     db_path = Path(getattr(_sandbox, "DB_PATH", srs_dir / "studyapp_srs.db"))
     srs_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -69,7 +83,7 @@ def _db() -> sqlite3.Connection:
 
 
 def _resolve_markdown(active_file: str) -> Path:
-    """Resolves a file name from the UI (with or without 'vault/' prefix) inside the sandbox."""
+    """Resolves a file name from the UI (with or without 'vault/' prefix) inside the dynamic AppData sandbox."""
     candidate = resolve_sandboxed_path(active_file)
     if not candidate.exists() and not active_file.replace("\\", "/").startswith("vault/"):
         candidate = resolve_sandboxed_path(f"vault/{active_file}")
@@ -82,9 +96,6 @@ _FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
 
 
 def markdown_blocks(text: str) -> List[Tuple[int, int]]:
-    """Splits Markdown into blocks (paragraphs, lists, fenced code, ...) separated by
-    blank lines. Returns [(start, end)] character offsets; `end` excludes the trailing
-    newline. Blank lines inside fenced code do not split a block. Fully deterministic."""
     blocks: List[Tuple[int, int]] = []
     pos = 0
     start = None
@@ -113,7 +124,6 @@ def _norm(s: str) -> str:
 
 
 def find_anchor_insert_offset(text: str, excerpt: str) -> int:
-    """Returns the offset right after the Markdown block containing the END of `excerpt`."""
     blocks = markdown_blocks(text)
     idx = text.find(excerpt)
     if idx >= 0:
@@ -130,7 +140,6 @@ def find_anchor_insert_offset(text: str, excerpt: str) -> int:
 
 
 def compute_surgical_insertion_offset(markdown_text: str, selected_text: str) -> int:
-    """Compatibility alias for find_anchor_insert_offset."""
     try:
         return find_anchor_insert_offset(markdown_text, selected_text)
     except ValueError:
@@ -139,7 +148,7 @@ def compute_surgical_insertion_offset(markdown_text: str, selected_text: str) ->
 
 @mcp.tool()
 def list_my_files(directory: str = "vault") -> List[str]:
-    """Returns array of available local .md, image, and 3D model files inside E:\\StudyApp\\MyFiles\\."""
+    """Returns array of available local .md, image, and 3D model files inside $APPLOCALDATA."""
     target_dir = resolve_sandboxed_path(directory)
     if not target_dir.exists():
         return []
@@ -153,14 +162,14 @@ def list_my_files(directory: str = "vault") -> List[str]:
 
 @mcp.tool()
 def read_file(filename: str) -> str:
-    """Pipes local file text directly into the model's context window."""
+    """Pipes local file text from $APPLOCALDATA directly into the model's context window."""
     target = _resolve_markdown(filename) if filename.endswith(".md") else resolve_sandboxed_path(filename)
     return target.read_text(encoding="utf-8")
 
 
 @mcp.tool()
 def write_markdown(filename: str, content: str, organ_system: str = "General") -> Dict[str, Any]:
-    """Saves processed textbook chunks or generated SRS cards directly to the E:\\ drive."""
+    """Saves processed textbook chunks or generated SRS cards directly to $APPLOCALDATA/vault."""
     if not filename.endswith(".md"):
         filename = f"{filename}.md"
     rel_arg = f"vault/{filename}" if not filename.replace("\\", "/").startswith("vault") else filename
@@ -168,7 +177,7 @@ def write_markdown(filename: str, content: str, organ_system: str = "General") -
     quota = check_disk_quota(0)
 
     try:
-        vault_dir = Path(getattr(_sandbox, "VAULT_DIR", _sandbox.SANDBOX_ROOT / "vault"))
+        vault_dir = Path(getattr(_sandbox, "VAULT_DIR", Path(_sandbox.SANDBOX_ROOT) / "vault"))
         rel = target.relative_to(vault_dir).as_posix()
     except ValueError:
         rel = target.name
@@ -203,8 +212,7 @@ def get_active_highlight() -> Dict[str, str]:
 
 @mcp.tool()
 def save_thought_anchor(anchor_id: str, explanation: str) -> Dict[str, Any]:
-    """Writes a customized AI margin-note into the active Markdown file, injected inline
-    directly below the highlighted paragraph, and records it in the thought_anchors table."""
+    """Writes a customized AI margin-note into the active Markdown file in $APPLOCALDATA/vault."""
     if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", anchor_id):
         raise ValueError("anchor_id must be 1-64 chars of [A-Za-z0-9_-].")
     with _STATE_LOCK:
@@ -230,7 +238,7 @@ def save_thought_anchor(anchor_id: str, explanation: str) -> Dict[str, Any]:
     )
     updated = original[:offset] + anchor_block + original[offset:]
 
-    vault_dir = Path(getattr(_sandbox, "VAULT_DIR", _sandbox.SANDBOX_ROOT / "vault"))
+    vault_dir = Path(getattr(_sandbox, "VAULT_DIR", Path(_sandbox.SANDBOX_ROOT) / "vault"))
     try:
         rel = target.relative_to(vault_dir).as_posix()
     except ValueError:
@@ -267,6 +275,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -274,6 +283,20 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
             self._reply(200, {"status": "ok"})
+        elif self.path == "/mcp":
+            self._reply(200, {
+                "status": "ok",
+                "server": "Convergence-Local-Bridge",
+                "endpoint": "http://localhost:1420/mcp",
+                "app_local_data_dir": str(_sandbox.SANDBOX_ROOT),
+                "tools": [
+                    "list_my_files",
+                    "read_file",
+                    "write_markdown",
+                    "get_active_highlight",
+                    "save_thought_anchor",
+                ],
+            })
         elif self.path == "/highlight":
             self._reply(200, get_active_highlight())
         else:
@@ -306,7 +329,7 @@ HighlightBridgeHandler = _BridgeHandler
 def start_bridge(host: str = BRIDGE_HOST, port: Optional[int] = None) -> ThreadingHTTPServer:
     actual_port = BRIDGE_PORT if port is None else port
     httpd = ThreadingHTTPServer((host, actual_port), _BridgeHandler)
-    threading.Thread(target=httpd.serve_forever, daemon=True, name="studyapp-bridge").start()
+    threading.Thread(target=httpd.serve_forever, daemon=True, name="convergence-bridge").start()
     return httpd
 
 
@@ -314,5 +337,16 @@ start_highlight_http_bridge = start_bridge
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Convergence Local MCP Sidecar")
+    parser.add_argument("--sidecar", action="store_true", help="Run as bundled Tauri sidecar")
+    parser.add_argument("--port", type=int, default=SIDECAR_PORT, help="Port to bind MCP HTTP endpoint")
+    args, _ = parser.parse_known_args()
+
+    ensure_appdata_directories(_sandbox.SANDBOX_ROOT)
     start_bridge()
+    if args.sidecar:
+        try:
+            sidecar_httpd = start_bridge(host=BRIDGE_HOST, port=args.port)
+        except OSError:
+            pass
     mcp.run()

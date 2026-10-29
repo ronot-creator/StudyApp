@@ -1,7 +1,7 @@
 import Database from "@tauri-apps/plugin-sql";
 import { ColabGradeResponse, OcclusionBox } from "../types/study";
 
-export const SQLITE_DB_URI = "sqlite:E:/StudyApp/MyFiles/srs_data/studyapp_srs.db";
+export const SQLITE_DB_URI = "sqlite:srs_data/studyapp_srs.db";
 
 export type ReplayGradedCallback = (result: ColabGradeResponse) => void;
 export interface DbLike { execute(sql: string, bindValues?: unknown[]): Promise<unknown>; select<T = unknown>(sql: string, bindValues?: unknown[]): Promise<T>; }

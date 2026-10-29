@@ -261,7 +261,7 @@ export function computeNextFsrsState(
 
 /**
  * Persists the updated FSRS state to `srs_cards` and appends an audit entry to `srs_review_logs`
- * inside `E:\StudyApp\MyFiles\srs_data\studyapp_srs.db`.
+ * inside `$APPLOCALDATA/srs_data/studyapp_srs.db`.
  *
  * Throws if the DB write fails so callers can surface the error to the user.
  */
@@ -389,7 +389,7 @@ export async function loadDueCards(limit = 200, now: Date = new Date()): Promise
       mcqCorrectIndex: r.mcq_correct_index ?? undefined,
       imageId: r.image_id ?? undefined,
       imagePath: r.image_filename
-        ? `E:/StudyApp/MyFiles/images/${r.image_filename}`
+        ? `$APPLOCALDATA/images/${r.image_filename}`
         : undefined,
       occlusionBoxesJson: r.occlusion_Boxes_json ?? r.image_boxes ?? undefined,
       stability: r.stability,
@@ -489,7 +489,7 @@ export const DEFAULT_SEED_CARDS: SrsCard[] = [
       "Identify the occluded microvascular and tubular structures of the Juxtaglomerular Apparatus and Glomerular Filtration Barrier:",
     markScheme:
       "1) Afferent Arteriole (Juxtaglomerular Granular Cells), 2) Efferent Arteriole (AT1 Receptor Target), 3) Macula Densa (Distal Convoluted Tubule NaCl Sensor).",
-    imagePath: "E:/StudyApp/MyFiles/images/renal_juxtaglomerular_apparatus.png",
+    imagePath: "$APPLOCALDATA/images/renal_juxtaglomerular_apparatus.png",
     occlusionBoxesJson: JSON.stringify([
       {
         id: "occ_1",

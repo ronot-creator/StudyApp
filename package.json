@@ -11,6 +11,12 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@milkdown/core": "^7.23.0",
+    "@milkdown/plugin-listener": "^7.23.0",
+    "@milkdown/plugin-math": "^7.5.9",
+    "@milkdown/preset-commonmark": "^7.23.0",
+    "@milkdown/preset-gfm": "^7.23.0",
+    "@milkdown/react": "^7.23.0",
     "@tauri-apps/api": "^2.1.0",
     "@tauri-apps/plugin-fs": "^2.1.0",
     "@tauri-apps/plugin-shell": "^2.1.0",
