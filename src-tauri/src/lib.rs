@@ -87,38 +87,91 @@ pub struct AiPanelStatus {
     pub partition_dir: String,
 }
 
-/// Resolves canonical AI provider identifier to `(panel_label, float_label, url, title)`
-pub fn resolve_ai_provider(provider: &str) -> Result<(String, String, String, String), String> {
-    match provider.to_lowercase().as_str() {
-        "gemini" => Ok((
-            "ai_panel_gemini".to_string(),
-            "ai_float_gemini".to_string(),
+/// Resolves canonical or custom AI provider identifier + optional custom URL to `(panel_label, float_label, url, title)`.
+/// Supports built-in providers (gemini, chatgpt, claude, notebooklm) AND unlimited user-pinned custom chatbots.
+pub fn resolve_ai_provider_with_url(
+    provider: &str,
+    custom_url: Option<&str>,
+) -> Result<(String, String, String, String), String> {
+    let clean_slug: String = provider
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if clean_slug.is_empty() {
+        return Err("AI provider identifier cannot be empty.".to_string());
+    }
+
+    let (default_url, default_title) = match clean_slug.as_str() {
+        "gemini" => (
             "https://gemini.google.com/app".to_string(),
             "Gemini 4 Argon — StudyApp Session".to_string(),
-        )),
-        "chatgpt" => Ok((
-            "ai_panel_chatgpt".to_string(),
-            "ai_float_chatgpt".to_string(),
+        ),
+        "chatgpt" => (
             "https://chatgpt.com/".to_string(),
             "ChatGPT — StudyApp Session".to_string(),
-        )),
-        "claude" => Ok((
-            "ai_panel_claude".to_string(),
-            "ai_float_claude".to_string(),
+        ),
+        "claude" => (
             "https://claude.ai/new".to_string(),
             "Claude — StudyApp Session".to_string(),
-        )),
-        "notebooklm" => Ok((
-            "ai_panel_notebooklm".to_string(),
-            "ai_float_notebooklm".to_string(),
+        ),
+        "notebooklm" => (
             "https://notebooklm.google.com/".to_string(),
             "NotebookLM — StudyApp Session".to_string(),
-        )),
-        other => Err(format!(
-            "Unsupported AI provider '{}'. Expected one of: gemini, chatgpt, claude, notebooklm.",
-            other
-        )),
-    }
+        ),
+        "perplexity" => (
+            "https://www.perplexity.ai/".to_string(),
+            "Perplexity — StudyApp Session".to_string(),
+        ),
+        "deepseek" => (
+            "https://chat.deepseek.com/".to_string(),
+            "DeepSeek — StudyApp Session".to_string(),
+        ),
+        "grok" => (
+            "https://grok.com/".to_string(),
+            "Grok — StudyApp Session".to_string(),
+        ),
+        "copilot" => (
+            "https://copilot.microsoft.com/".to_string(),
+            "Microsoft Copilot — StudyApp Session".to_string(),
+        ),
+        "poe" => (
+            "https://poe.com/".to_string(),
+            "Poe — StudyApp Session".to_string(),
+        ),
+        "mistral" | "lechat" => (
+            "https://chat.mistral.ai/".to_string(),
+            "Mistral Le Chat — StudyApp Session".to_string(),
+        ),
+        _ => {
+            let fallback = format!(
+                "https://duckduckgo.com/?q={}+AI+chat",
+                provider.trim().replace(' ', "+")
+            );
+            (
+                fallback,
+                format!("{} — StudyApp AI Session", provider.trim()),
+            )
+        }
+    };
+
+    let resolved_url = match custom_url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
+        Some(u) => format!("https://{u}"),
+        None => default_url,
+    };
+
+    Ok((
+        format!("ai_panel_{clean_slug}"),
+        format!("ai_float_{clean_slug}"),
+        resolved_url,
+        default_title,
+    ))
+}
+
+pub fn resolve_ai_provider(provider: &str) -> Result<(String, String, String, String), String> {
+    resolve_ai_provider_with_url(provider, None)
 }
 
 /// Canonicalises `path` even when it does not exist yet by resolving the deepest existing ancestor
@@ -276,9 +329,11 @@ fn switch_active_ai_panel(
     y: f64,
     width: f64,
     height: f64,
+    target_url: Option<String>,
 ) -> Result<AiPanelStatus, String> {
     let norm_provider = provider.to_lowercase();
-    let (panel_label, float_label, target_url, _title) = resolve_ai_provider(&norm_provider)?;
+    let (panel_label, float_label, target_url, _title) =
+        resolve_ai_provider_with_url(&norm_provider, target_url.as_deref())?;
 
     // Holding this lock for the whole swap serialises concurrent switch/redock requests.
     let mut active_guard = state
@@ -389,7 +444,7 @@ fn mount_persistent_ai_panel(
         "gemini"
     };
 
-    let status = switch_active_ai_panel(app, state, inferred.to_string(), 920.0, 56.0, 680.0, 904.0)?;
+    let status = switch_active_ai_panel(app, state, inferred.to_string(), 920.0, 56.0, 680.0, 904.0, Some(target_url))?;
     Ok(format!("Mounted {} ({}) in mode {}", status.provider, status.label, status.mode))
 }
 
@@ -400,9 +455,11 @@ fn detach_ai_panel(
     app: tauri::AppHandle,
     state: State<'_, AppRuntimeState>,
     provider: String,
+    target_url: Option<String>,
 ) -> Result<AiPanelStatus, String> {
     let norm_provider = provider.to_lowercase();
-    let (panel_label, float_label, target_url, title) = resolve_ai_provider(&norm_provider)?;
+    let (panel_label, float_label, target_url, title) =
+        resolve_ai_provider_with_url(&norm_provider, target_url.as_deref())?;
 
     // Unmount docked child webview if currently active
     {
@@ -469,9 +526,11 @@ fn redock_ai_panel(
     y: f64,
     width: f64,
     height: f64,
+    target_url: Option<String>,
 ) -> Result<AiPanelStatus, String> {
     let norm_provider = provider.to_lowercase();
-    let (_panel_label, float_label, _target_url, _title) = resolve_ai_provider(&norm_provider)?;
+    let (_panel_label, float_label, _target_url, _title) =
+        resolve_ai_provider_with_url(&norm_provider, target_url.as_deref())?;
 
     if let Some(float_win) = app.get_webview_window(&float_label) {
         let _ = float_win.close();
@@ -485,7 +544,34 @@ fn redock_ai_panel(
         detached_guard.remove(&norm_provider);
     }
 
-    switch_active_ai_panel(app, state, norm_provider, x, y, width, height)
+    switch_active_ai_panel(app, state, norm_provider, x, y, width, height, target_url)
+}
+
+/// Navigates an active docked or floating AI WebView to a new URL or search query inside its mini-browser bar
+#[tauri::command]
+fn navigate_ai_panel(
+    app: tauri::AppHandle,
+    provider: String,
+    url: String,
+) -> Result<String, String> {
+    let norm_provider = provider.to_lowercase();
+    let (panel_label, float_label, resolved_url, _) =
+        resolve_ai_provider_with_url(&norm_provider, Some(&url))?;
+    let parsed: url::Url = resolved_url
+        .parse()
+        .map_err(|e| format!("Invalid target URL: {e}"))?;
+
+    if let Some(wv) = app.get_webview(&panel_label) {
+        wv.navigate(parsed.clone())
+            .map_err(|e| format!("Failed to navigate docked webview '{panel_label}': {e}"))?;
+        return Ok(resolved_url);
+    }
+    if let Some(win) = app.get_webview_window(&float_label) {
+        win.navigate(parsed)
+            .map_err(|e| format!("Failed to navigate floating window '{float_label}': {e}"))?;
+        return Ok(resolved_url);
+    }
+    Ok(resolved_url)
 }
 
 /// Syncs the native docked child Web-View bounds whenever the user drags the React split-pane divider
@@ -587,6 +673,7 @@ pub fn run() {
             detach_ai_panel,
             redock_ai_panel,
             resize_docked_ai_panel,
+            navigate_ai_panel,
             update_active_highlight,
         ])
         .run(tauri::generate_context!())

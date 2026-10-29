@@ -270,6 +270,21 @@ export class SpecimenSourcingService {
         organSystem,
         anatomicalQuery
       );
+      const svgDiagram = `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="320" viewBox="0 0 640 320">
+        <defs>
+          <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#0f172a"/>
+            <stop offset="100%" stop-color="#1e293b"/>
+          </linearGradient>
+        </defs>
+        <rect width="640" height="320" rx="14" fill="url(#bg)" stroke="#38bdf8" stroke-opacity="0.4"/>
+        <circle cx="200" cy="155" r="78" fill="rgba(56,189,248,0.12)" stroke="#38bdf8" stroke-width="2"/>
+        <path d="M 80 120 Q 140 135 190 140 M 210 170 Q 270 180 340 205 M 280 95 L 490 95 M 280 225 L 510 225" stroke="#818cf8" stroke-width="2.5" fill="none"/>
+        <text x="24" y="36" fill="#38bdf8" font-family="sans-serif" font-size="15" font-weight="bold">${organSystem} — ${anatomicalQuery.replace(/[<>&"']/g, "")}</text>
+        <text x="24" y="58" fill="#94a3b8" font-family="sans-serif" font-size="12">Modality: ${modality} | Sandbox File: E:\\StudyApp\\MyFiles\\${localPath.replace(/\//g, "\\")}</text>
+      </svg>`;
+      const svgDataUri = `data:image/svg+xml;utf8,${encodeURIComponent(svgDiagram)}`;
+
       const fallbackAsset: SourcedMedicalAsset = {
         id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         descriptiveFilename: filename,
@@ -278,9 +293,9 @@ export class SpecimenSourcingService {
         modality,
         sourceCredit:
           modality === "model_3d"
-            ? "Sketchfab CC-BY 3D Medical Anatomy Repository (placeholder)"
-            : "NIH Open-i / PEIR Pathology Open Access Archive (placeholder)",
-        sourceUrl: `file://${localPath}`,
+            ? "Sketchfab CC-BY 3D Medical Anatomy Repository (Local Sandbox)"
+            : "NIH Open-i / PEIR Pathology Open Access Archive (Local Sandbox)",
+        sourceUrl: svgDataUri,
         occlusionBoxes: boxes,
       };
       results.push(fallbackAsset);

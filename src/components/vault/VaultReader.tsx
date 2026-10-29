@@ -26,10 +26,12 @@ export const DEFAULT_VAULT_NOTES: VaultNoteFile[] = CANONICAL_ORGAN_SYSTEMS.map(
 }));
 
 export function parseThoughtAnchors(markdownContent: string): Array<{ id: string; text: string }> {
-  const anchorRegex =
-    /<!-- thought-anchor:([^\s>]+) -->\s*> \*\*\[AI Margin Note #[^\]]+\]:?\*\*:?\s*([\s\S]*?)\s*<!-- \/thought-anchor:\1 -->/g;
   const extracted: Array<{ id: string; text: string }> = [];
   let match: RegExpExecArray | null;
+
+  // 1. Original margin-note block format: <!-- thought-anchor:id --> ... <!-- /thought-anchor:id -->
+  const anchorRegex =
+    /<!-- thought-anchor:([^\s>]+) -->\s*> \*\*\[AI Margin Note #[^\]]+\]:?\*\*:?\s*([\s\S]*?)\s*<!-- \/thought-anchor:\1 -->/g;
   while ((match = anchorRegex.exec(markdownContent)) !== null) {
     const cleanText = match[2]
       .split("\n")
@@ -38,6 +40,24 @@ export function parseThoughtAnchors(markdownContent: string): Array<{ id: string
       .join(" ");
     extracted.push({ id: match[1], text: cleanText });
   }
+
+  // 2. Inline HTML comment format: <!-- ANCHOR: id | text -->
+  const commentRegex = /<!--\s*ANCHOR:\s*([^|>]+?)\s*\|\s*([\s\S]*?)\s*-->/g;
+  while ((match = commentRegex.exec(markdownContent)) !== null) {
+    extracted.push({ id: match[1].trim(), text: match[2].trim() });
+  }
+
+  // 3. Constitution [? ... ?] single and multi-line Thought Anchors
+  const bracketRegex = /\[\?\s*([\s\S]*?)\s*\?\]/g;
+  let idx = 0;
+  while ((match = bracketRegex.exec(markdownContent)) !== null) {
+    idx++;
+    const text = match[1].trim();
+    if (text && !extracted.some((r) => r.text === text)) {
+      extracted.push({ id: `anchor_${idx}`, text });
+    }
+  }
+
   return extracted;
 }
 

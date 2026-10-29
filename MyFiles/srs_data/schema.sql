@@ -109,3 +109,13 @@ CREATE TABLE IF NOT EXISTS grading_queue (
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
     retry_count INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS ai_providers (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    url TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 1 CHECK (pinned IN (0, 1)),
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    is_custom INTEGER NOT NULL DEFAULT 1 CHECK (is_custom IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

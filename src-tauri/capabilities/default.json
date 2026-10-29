@@ -1,9 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for StudyApp main shell and persistent study_session native AI WebViews on E:\\StudyApp\\MyFiles\\",
+  "description": "Capabilities for StudyApp main shell and unlimited persistent study_session native AI WebViews on E:\\StudyApp\\MyFiles\\",
   "windows": [
     "main",
+    "ai_panel_*",
+    "ai_float_*",
     "ai_panel_gemini",
     "ai_panel_chatgpt",
     "ai_panel_claude",
@@ -12,6 +14,11 @@
     "ai_float_chatgpt",
     "ai_float_claude",
     "ai_float_notebooklm"
+  ],
+  "webviews": [
+    "main",
+    "ai_panel_*",
+    "ai_float_*"
   ],
   "permissions": [
     "core:default",
@@ -35,6 +42,7 @@
     "detach_ai_panel",
     "redock_ai_panel",
     "resize_docked_ai_panel",
+    "navigate_ai_panel",
     "mount_persistent_ai_panel",
     "update_active_highlight",
     "shell:allow-open",

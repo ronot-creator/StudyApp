@@ -27,7 +27,16 @@ export const CANONICAL_ORGAN_SYSTEMS: OrganSystem[] = [
   "Multisystem/General",
 ];
 
-export type AiProviderId = "gemini" | "chatgpt" | "claude" | "notebooklm";
+/** Supports canonical providers ("gemini" | "chatgpt" | "claude" | "notebooklm") and unlimited user-pinned chatbots. */
+export type AiProviderId = string;
+
+export interface AiProviderConfig {
+  id: AiProviderId;
+  label: string;
+  url: string;
+  pinned: boolean;
+  isCustom?: boolean;
+}
 
 export interface OcclusionBox {
   id: string;

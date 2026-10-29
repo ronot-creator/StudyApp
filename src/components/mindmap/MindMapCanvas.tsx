@@ -7,6 +7,12 @@ import {
   Edge,
   MarkerType,
   NodeMouseHandler,
+  OnNodesChange,
+  OnEdgesChange,
+  OnConnect,
+  applyNodeChanges,
+  applyEdgeChanges,
+  Connection,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
@@ -37,6 +43,7 @@ export interface MindMapCanvasProps {
 }
 
 export const VAULT_STORAGE_PREFIX = "studyapp_vault_md_";
+export const NODE_POS_STORAGE_PREFIX = "studyapp_mindmap_pos_";
 
 export const DEFAULT_SYSTEM_VAULT_MARKDOWN: Record<OrganSystem, string> = {
   Renal: `# Glomerular Filtration & Tubuloglomerular Feedback (TGF)
@@ -193,10 +200,82 @@ export function appendTripleToVaultMarkdown(
   return `${markdownContent.trim()}\n\n\`\`\`mindmap\n${tripleLine}\n\`\`\`\n`;
 }
 
-/**
- * Extracts only the text enclosed inside ` \`\`\`mindmap ... \`\`\` ` fenced code blocks.
- * Standard Markdown prose outside these blocks is ignored by the graph parser.
- */
+export function replaceMindMapBlockWithTriples(
+  markdownContent: string,
+  triples: Array<{
+    sourceNode: string;
+    linkingPhrase: string;
+    targetNode: string;
+    isCrossSystemBridge?: boolean;
+    targetOrganSystem?: OrganSystem;
+  }>
+): string {
+  const lines = triples.map((t) => {
+    const phrase = t.linkingPhrase.trim().split(/\s+/).slice(0, 30).join(" ");
+    const tgt =
+      t.isCrossSystemBridge && t.targetOrganSystem
+        ? `${t.targetOrganSystem}::${t.targetNode.trim()}`
+        : t.targetNode.trim();
+    return `[${t.sourceNode.trim()}] --(${phrase})--> [${tgt}]`;
+  });
+  const newBlock = `\`\`\`mindmap\n${lines.join("\n")}\n\`\`\``;
+  const blockRegex = /```mindmap\s*[\s\S]*?```/i;
+  if (blockRegex.test(markdownContent)) {
+    return markdownContent.replace(blockRegex, newBlock);
+  }
+  return `${markdownContent.trim()}\n\n${newBlock}\n`;
+}
+
+export function renameNodeInMarkdown(
+  organSystem: OrganSystem,
+  markdownContent: string,
+  oldLabel: string,
+  newLabel: string
+): string {
+  const cleanNew = newLabel.replace(/[\[\]\r\n]+/g, " ").trim();
+  if (!cleanNew || cleanNew === oldLabel) return markdownContent;
+  const parsed = parseMarkdownMindMapTriples(organSystem, markdownContent);
+  const updated = parsed.map((t) => ({
+    ...t,
+    sourceNode: t.sourceNode === oldLabel ? cleanNew : t.sourceNode,
+    targetNode: t.targetNode === oldLabel ? cleanNew : t.targetNode,
+  }));
+  return replaceMindMapBlockWithTriples(markdownContent, updated);
+}
+
+export function deleteNodeFromMarkdown(
+  organSystem: OrganSystem,
+  markdownContent: string,
+  nodeLabel: string
+): string {
+  const parsed = parseMarkdownMindMapTriples(organSystem, markdownContent);
+  const remaining = parsed.filter(
+    (t) => t.sourceNode !== nodeLabel && t.targetNode !== nodeLabel
+  );
+  return replaceMindMapBlockWithTriples(markdownContent, remaining);
+}
+
+export function deleteEdgeFromMarkdown(
+  organSystem: OrganSystem,
+  markdownContent: string,
+  edgeIdOrPair: { id?: string; source?: string; target?: string }
+): string {
+  const parsed = parseMarkdownMindMapTriples(organSystem, markdownContent);
+  const remaining = parsed.filter((t) => {
+    if (edgeIdOrPair.id && t.id === edgeIdOrPair.id) return false;
+    if (
+      edgeIdOrPair.source &&
+      edgeIdOrPair.target &&
+      t.sourceNode === edgeIdOrPair.source &&
+      t.targetNode === edgeIdOrPair.target
+    ) {
+      return false;
+    }
+    return true;
+  });
+  return replaceMindMapBlockWithTriples(markdownContent, remaining);
+}
+
 export function extractMindMapCodeBlocks(markdownText: string): string {
   const blockRegex = /```mindmap\s*([\s\S]*?)```/gi;
   const blocks: string[] = [];
@@ -209,11 +288,6 @@ export function extractMindMapCodeBlocks(markdownText: string): string {
   return blocks.join("\n");
 }
 
-/**
- * Deterministically parses `[Source Node] --(linking phrase <= 30 words)--> [Target Node]`
- * syntax exclusively from inside ` \`\`\`mindmap ` code blocks in Markdown notes.
- * Supports `System::Node` cross-system portal bridges.
- */
 export function parseMarkdownMindMapTriples(
   organSystem: OrganSystem,
   markdownText: string
@@ -263,7 +337,38 @@ export function parseMarkdownMindMapTriples(
   return triples;
 }
 
-export function buildGraphFromTriples(triples: ParsedTriple[]): {
+export function loadSavedNodePositions(
+  organSystem: OrganSystem
+): Record<string, { x: number; y: number }> {
+  try {
+    const raw = localStorage.getItem(`${NODE_POS_STORAGE_PREFIX}${organSystem}`);
+    if (raw) {
+      return JSON.parse(raw);
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
+export function saveNodePosition(
+  organSystem: OrganSystem,
+  nodeId: string,
+  pos: { x: number; y: number }
+): void {
+  try {
+    const map = loadSavedNodePositions(organSystem);
+    map[nodeId] = { x: Math.round(pos.x), y: Math.round(pos.y) };
+    localStorage.setItem(`${NODE_POS_STORAGE_PREFIX}${organSystem}`, JSON.stringify(map));
+  } catch {
+    // ignore
+  }
+}
+
+export function buildGraphFromTriples(
+  triples: ParsedTriple[],
+  savedPositions: Record<string, { x: number; y: number }> = {}
+): {
   nodes: Node<MindMapNodeData>[];
   edges: Edge[];
 } {
@@ -292,10 +397,12 @@ export function buildGraphFromTriples(triples: ParsedTriple[]): {
 
   const rfNodes: Node<MindMapNodeData>[] = Array.from(nodeMap.values()).map((item, idx) => ({
     id: item.id,
-    position: {
+    position: savedPositions[item.id] ?? {
       x: (idx % 2) * 380 + 60,
       y: Math.floor(idx / 2) * 145 + 40,
     },
+    draggable: true,
+    selectable: true,
     data: {
       label: item.isBridge
         ? `🌐 [${item.bridgeSys}::${item.label}]`
@@ -306,8 +413,8 @@ export function buildGraphFromTriples(triples: ParsedTriple[]): {
     },
     style: {
       background: item.isBridge
-        ? "rgba(99, 102, 241, 0.28)"
-        : "rgba(15, 23, 42, 0.85)",
+        ? "rgba(99, 102, 241, 0.30)"
+        : "rgba(15, 23, 42, 0.86)",
       color: "#f8fafc",
       border: item.isBridge
         ? "1.5px solid #818cf8"
@@ -317,7 +424,10 @@ export function buildGraphFromTriples(triples: ParsedTriple[]): {
       fontSize: "12.5px",
       fontWeight: 600,
       width: 250,
-      cursor: item.isBridge ? "pointer" : "default",
+      cursor: item.isBridge ? "pointer" : "grab",
+      boxShadow: item.isBridge
+        ? "0 8px 24px -4px rgba(99, 102, 241, 0.35), inset 0 1px 0 0 rgba(255,255,255,0.22)"
+        : "0 8px 20px -4px rgba(2, 6, 23, 0.65), inset 0 1px 0 0 rgba(255,255,255,0.16)",
     },
   }));
 
@@ -358,6 +468,9 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   );
   const [nodes, setNodes] = useState<Node<MindMapNodeData>[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedNodeRenameText, setSelectedNodeRenameText] = useState<string>("");
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [selectedPortalNode, setSelectedPortalNode] = useState<{
     nodeId: string;
     label: string;
@@ -365,33 +478,41 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   } | null>(null);
   const [extractingColab, setExtractingColab] = useState<boolean>(false);
 
-  // Interactive Triple Builder state
   const [newSourceNode, setNewSourceNode] = useState<string>("");
   const [newLinkingPhrase, setNewLinkingPhrase] = useState<string>("");
   const [newTargetNode, setNewTargetNode] = useState<string>("");
   const [newBridgeSystem, setNewBridgeSystem] = useState<string>("");
   const [saveToast, setSaveToast] = useState<string | null>(null);
 
+  const showToast = (msg: string) => {
+    setSaveToast(msg);
+    window.setTimeout(() => setSaveToast(null), 4000);
+  };
+
   const handleSelectSystem = useCallback(
     (nextSystem: OrganSystem) => {
       setInternalSystem(nextSystem);
       setSelectedPortalNode(null);
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
       onOrganSystemChange?.(nextSystem);
     },
     [onOrganSystemChange]
   );
 
-  // Dynamically read E:\StudyApp\MyFiles\vault\{organSystem}.md on OrganSystem tab switch
   useEffect(() => {
     let cancelled = false;
     setSelectedPortalNode(null);
+    setSelectedNodeId(null);
+    setSelectedEdgeId(null);
 
     const loadVaultMarkdownForSystem = async () => {
       const markdownContent = await readOrganSystemVaultMarkdown(activeSystem);
       if (cancelled) return;
       setSyntaxInput(markdownContent);
       const parsed = parseMarkdownMindMapTriples(activeSystem, markdownContent);
-      const nextGraph = buildGraphFromTriples(parsed);
+      const savedPos = loadSavedNodePositions(activeSystem);
+      const nextGraph = buildGraphFromTriples(parsed, savedPos);
       setNodes(nextGraph.nodes);
       setEdges(nextGraph.edges);
     };
@@ -405,19 +526,22 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   const persistGraphToSqlite = async (system: OrganSystem, parsedTriples: ParsedTriple[]) => {
     try {
       const db = await Database.load(SQLITE_DB_URI);
+      const posMap = loadSavedNodePositions(system);
       for (const idx of parsedTriples.keys()) {
         const t = parsedTriples[idx];
         const srcId = `node_${system}_${t.sourceNode.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
         const tgtId = `node_${system}_${t.targetNode.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+        const srcPos = posMap[t.sourceNode] ?? { x: (idx % 2) * 380 + 60, y: Math.floor(idx / 2) * 145 + 40 };
+        const tgtPos = posMap[t.targetNode] ?? { x: 440, y: Math.floor(idx / 2) * 145 + 100 };
         await db.execute(
           `INSERT OR REPLACE INTO mindmap_nodes (id, organ_system, label, position_x, position_y)
            VALUES ($1, $2, $3, $4, $5)`,
-          [srcId, system, t.sourceNode, (idx % 2) * 380 + 60, Math.floor(idx / 2) * 145 + 40]
+          [srcId, system, t.sourceNode, srcPos.x, srcPos.y]
         );
         await db.execute(
           `INSERT OR REPLACE INTO mindmap_nodes (id, organ_system, label, position_x, position_y)
            VALUES ($1, $2, $3, $4, $5)`,
-          [tgtId, t.targetOrganSystem ?? system, t.targetNode, 440, Math.floor(idx / 2) * 145 + 100]
+          [tgtId, t.targetOrganSystem ?? system, t.targetNode, tgtPos.x, tgtPos.y]
         );
         await db.execute(
           `INSERT OR REPLACE INTO mindmap_edges (id, source_node_id, target_node_id, linking_phrase, is_cross_system_bridge, target_organ_system)
@@ -437,14 +561,59 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     }
   };
 
-  const handleSyntaxChange = (nextMarkdown: string) => {
-    setSyntaxInput(nextMarkdown);
-    const parsed = parseMarkdownMindMapTriples(activeSystem, nextMarkdown);
-    const nextGraph = buildGraphFromTriples(parsed);
-    setNodes(nextGraph.nodes);
-    setEdges(nextGraph.edges);
-    void writeOrganSystemVaultMarkdown(activeSystem, nextMarkdown);
-  };
+  const handleSyntaxChange = useCallback(
+    (nextMarkdown: string) => {
+      setSyntaxInput(nextMarkdown);
+      const parsed = parseMarkdownMindMapTriples(activeSystem, nextMarkdown);
+      const savedPos = loadSavedNodePositions(activeSystem);
+      const nextGraph = buildGraphFromTriples(parsed, savedPos);
+      setNodes(nextGraph.nodes);
+      setEdges(nextGraph.edges);
+      void writeOrganSystemVaultMarkdown(activeSystem, nextMarkdown);
+      void persistGraphToSqlite(activeSystem, parsed);
+    },
+    [activeSystem]
+  );
+
+  const onNodesChange: OnNodesChange<Node<MindMapNodeData>> = useCallback(
+    (changes) => {
+      setNodes((nds) => {
+        const updated = applyNodeChanges(changes, nds);
+        for (const ch of changes) {
+          if (ch.type === "position" && ch.position && ch.id) {
+            saveNodePosition(activeSystem, ch.id, ch.position);
+          }
+        }
+        return updated;
+      });
+    },
+    [activeSystem]
+  );
+
+  const onEdgesChange: OnEdgesChange<Edge> = useCallback(
+    (changes) => {
+      setEdges((eds) => applyEdgeChanges(changes, eds));
+      for (const ch of changes) {
+        if (ch.type === "remove" && ch.id) {
+          const updatedMd = deleteEdgeFromMarkdown(activeSystem, syntaxInput, { id: ch.id });
+          handleSyntaxChange(updatedMd);
+        }
+      }
+    },
+    [activeSystem, syntaxInput, handleSyntaxChange]
+  );
+
+  const onConnect: OnConnect = useCallback(
+    (connection: Connection) => {
+      if (!connection.source || !connection.target || connection.source === connection.target) return;
+      const defaultPhrase = "physiologically regulates";
+      const tripleLine = `[${connection.source}] --(${defaultPhrase})--> [${connection.target}]`;
+      const updatedMd = appendTripleToVaultMarkdown(syntaxInput, tripleLine);
+      handleSyntaxChange(updatedMd);
+      showToast(`Connected [${connection.source}] → [${connection.target}]`);
+    },
+    [syntaxInput, handleSyntaxChange]
+  );
 
   const handleAddTriple = async () => {
     if (!newSourceNode.trim() || !newLinkingPhrase.trim() || !newTargetNode.trim()) return;
@@ -456,22 +625,54 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     const tripleLine = `[${newSourceNode.trim()}] --(${cappedPhrase})--> [${targetExpr}]`;
     const updatedMd = appendTripleToVaultMarkdown(syntaxInput, tripleLine);
     handleSyntaxChange(updatedMd);
-    const parsed = parseMarkdownMindMapTriples(activeSystem, updatedMd);
-    await persistGraphToSqlite(activeSystem, parsed);
     setNewSourceNode("");
     setNewLinkingPhrase("");
     setNewTargetNode("");
     setNewBridgeSystem("");
-    setSaveToast(`Added triple to ${activeSystem}.md & SQLite mindmap_edges`);
-    window.setTimeout(() => setSaveToast(null), 4000);
+    showToast(`Added triple to ${activeSystem}.md & SQLite mindmap_edges`);
+  };
+
+  const handleRenameSelectedNode = () => {
+    if (!selectedNodeId || !selectedNodeRenameText.trim()) return;
+    const updatedMd = renameNodeInMarkdown(
+      activeSystem,
+      syntaxInput,
+      selectedNodeId,
+      selectedNodeRenameText.trim()
+    );
+    handleSyntaxChange(updatedMd);
+    setSelectedNodeId(selectedNodeRenameText.trim());
+    showToast(`Renamed node "${selectedNodeId}" → "${selectedNodeRenameText.trim()}"`);
+  };
+
+  const handleDeleteSelectedNode = () => {
+    if (!selectedNodeId) return;
+    const updatedMd = deleteNodeFromMarkdown(activeSystem, syntaxInput, selectedNodeId);
+    handleSyntaxChange(updatedMd);
+    setSelectedNodeId(null);
+    setSelectedPortalNode(null);
+    showToast(`Deleted node "${selectedNodeId}" and its incident edges`);
+  };
+
+  const handleDeleteSelectedEdge = () => {
+    if (!selectedEdgeId) return;
+    const updatedMd = deleteEdgeFromMarkdown(activeSystem, syntaxInput, { id: selectedEdgeId });
+    handleSyntaxChange(updatedMd);
+    setSelectedEdgeId(null);
+    showToast(`Removed causal edge ${selectedEdgeId}`);
   };
 
   const handleNodeClick: NodeMouseHandler<Node<MindMapNodeData>> = useCallback((_event, node) => {
     const data = node.data;
+    const rawName = data?.rawLabel || node.id;
+    setSelectedNodeId(rawName);
+    setSelectedNodeRenameText(rawName);
+    setSelectedEdgeId(null);
+
     if (data?.isBridge && data.targetOrganSystem) {
       setSelectedPortalNode({
         nodeId: node.id,
-        label: data.rawLabel || String(data.label),
+        label: rawName,
         targetOrganSystem: data.targetOrganSystem,
       });
       return;
@@ -496,14 +697,33 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     setSelectedPortalNode(null);
   }, []);
 
+  const handleNodeDoubleClick: NodeMouseHandler<Node<MindMapNodeData>> = useCallback(
+    (_event, node) => {
+      const data = node.data;
+      if (data?.isBridge && data.targetOrganSystem) {
+        handleSelectSystem(data.targetOrganSystem);
+      }
+    },
+    [handleSelectSystem]
+  );
+
   const handleExtractViaColab = async () => {
-    const tunnelUrl = getNgrokGrader().getTunnelUrl();
-    if (!tunnelUrl) return;
+    const grader = getNgrokGrader();
+    const tunnelUrl = grader.getTunnelUrl();
+    if (!tunnelUrl) {
+      showToast("Configure Colab 3B Ngrok Tunnel URL in the topbar first.");
+      return;
+    }
     setExtractingColab(true);
     try {
+      const fleetToken = localStorage.getItem("studyapp_fleet_token") || "studyapp-local-secret";
       const resp = await fetch(`${tunnelUrl}/extract-mindmap-triples`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Fleet-Token": fleetToken,
+          "ngrok-skip-browser-warning": "true",
+        },
         body: JSON.stringify({
           organ_system: activeSystem,
           markdown_text: syntaxInput,
@@ -524,8 +744,11 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
             .join("\n");
           const wrapped = `\`\`\`mindmap\n${formattedLines}\n\`\`\``;
           handleSyntaxChange(wrapped);
+          showToast(`Extracted ${data.triples.length} triples via Colab 3B`);
         }
       }
+    } catch {
+      showToast("Colab 3B tunnel unreachable — using local deterministic parser.");
     } finally {
       setExtractingColab(false);
     }
@@ -600,7 +823,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           ))}
           <button
             className="liquid-btn liquid-btn-secondary"
-            onClick={handleExtractViaColab}
+            onClick={() => void handleExtractViaColab()}
             disabled={extractingColab}
           >
             {extractingColab ? "Extracting..." : "Colab 3B Auto-Extract Triples"}
@@ -608,7 +831,6 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         </div>
       </div>
 
-      {/* Interactive Triple Builder Bar */}
       <div className="liquid-card" style={{ padding: "12px 16px" }}>
         <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "8px" }}>
           Add Physiological Causal Link (auto-appends to <code>```mindmap</code> block in{" "}
@@ -655,6 +877,67 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         </div>
       </div>
 
+      {(selectedNodeId || selectedEdgeId) && (
+        <div
+          className="liquid-card"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "10px",
+            padding: "10px 14px",
+            flexWrap: "wrap",
+          }}
+        >
+          {selectedNodeId && (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
+                <span style={{ fontSize: "12px", color: "#94a3b8" }}>Edit Node:</span>
+                <input
+                  className="liquid-input"
+                  style={{ maxWidth: "260px" }}
+                  value={selectedNodeRenameText}
+                  onChange={(e) => setSelectedNodeRenameText(e.target.value)}
+                />
+                <button className="liquid-btn" onClick={handleRenameSelectedNode}>
+                  Rename Node
+                </button>
+                <button
+                  className="liquid-btn liquid-btn-secondary"
+                  style={{ borderColor: "rgba(251, 113, 133, 0.45)", color: "#fb7185" }}
+                  onClick={handleDeleteSelectedNode}
+                >
+                  Delete Node
+                </button>
+              </div>
+              {selectedPortalNode && (
+                <button
+                  className="liquid-btn"
+                  onClick={() => handleSelectSystem(selectedPortalNode.targetOrganSystem)}
+                >
+                  🌐 Jump to {selectedPortalNode.targetOrganSystem} Portal &rarr;
+                </button>
+              )}
+            </>
+          )}
+
+          {selectedEdgeId && (
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>
+                Selected Causal Edge: <code>{selectedEdgeId}</code>
+              </span>
+              <button
+                className="liquid-btn liquid-btn-secondary"
+                style={{ borderColor: "rgba(251, 113, 133, 0.45)", color: "#fb7185" }}
+                onClick={handleDeleteSelectedEdge}
+              >
+                Delete Edge
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
       <div
         style={{ position: "relative", height: "360px", borderRadius: "14px", overflow: "hidden" }}
         className="liquid-card"
@@ -662,7 +945,15 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         <ReactFlow
           nodes={nodes}
           edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
           onNodeClick={handleNodeClick}
+          onNodeDoubleClick={handleNodeDoubleClick}
+          onEdgeClick={(_e, edge) => {
+            setSelectedEdgeId(edge.id);
+            setSelectedNodeId(null);
+          }}
           fitView
         >
           <Background color="rgba(148, 163, 184, 0.18)" gap={20} />
