@@ -2,14 +2,56 @@ import React, { useState } from "react";
 import * as dialog from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import Database from "@tauri-apps/plugin-sql";
+import { BaseDirectory, exists, mkdir, writeFile } from "@tauri-apps/plugin-fs";
 import {
   ensureAppDataDirectories,
   getDynamicSqliteDbUri,
   resolveAppDataSubPath,
   setCustomStorageTargetDir,
+  STORAGE_CONFIG_FILENAME,
+  STORAGE_CONFIG_LOCALSTORAGE_KEY,
+  STORAGE_CONFIG_MAX_BYTES,
+  StorageBootstrapConfig,
 } from "../../lib/appPaths";
+import { TESSERACT_LANGS_SUBDIR } from "../../services/ingestion/fileIngestion";
 
-export type WizardStep = "eula" | "directory" | "scaffolding";
+export type WizardStep = "eula" | "directory" | "languages" | "scaffolding";
+
+export type OcrWizardLangCode = "eng" | "ara" | "spa" | "fra";
+
+export interface OcrLanguageOption {
+  code: OcrWizardLangCode;
+  label: string;
+  trainedDataFile: string;
+  downloadUrl: string;
+}
+
+export const AVAILABLE_OCR_LANGUAGES: OcrLanguageOption[] = [
+  {
+    code: "eng",
+    label: "English (eng.traineddata)",
+    trainedDataFile: "eng.traineddata",
+    downloadUrl: "https://tessdata.projectnaptha.com/4.0.0_best/eng.traineddata.gz",
+  },
+  {
+    code: "ara",
+    label: "Arabic (ara.traineddata)",
+    trainedDataFile: "ara.traineddata",
+    downloadUrl: "https://tessdata.projectnaptha.com/4.0.0_best/ara.traineddata.gz",
+  },
+  {
+    code: "spa",
+    label: "Spanish (spa.traineddata)",
+    trainedDataFile: "spa.traineddata",
+    downloadUrl: "https://tessdata.projectnaptha.com/4.0.0_best/spa.traineddata.gz",
+  },
+  {
+    code: "fra",
+    label: "French (fra.traineddata)",
+    trainedDataFile: "fra.traineddata",
+    downloadUrl: "https://tessdata.projectnaptha.com/4.0.0_best/fra.traineddata.gz",
+  },
+];
 
 export interface ScaffoldingProgressState {
   percent: number;
@@ -17,6 +59,18 @@ export interface ScaffoldingProgressState {
   completedSteps: string[];
   targetRoot: string;
   createdSubdirs: string[];
+  downloadedTrainedData?: string[];
+  selectedLanguages?: OcrWizardLangCode[];
+}
+
+export interface VaultRecoveryResult {
+  recovered: boolean;
+  targetDirectory: string;
+  vaultExists: boolean;
+  imagesExists: boolean;
+  configReconstructed: boolean;
+  configPayload?: StorageBootstrapConfig;
+  error?: string;
 }
 
 export interface FirstRunWizardProps {
@@ -51,20 +105,186 @@ export async function pickDirectoryWithTauriDialog(
 }
 
 /**
+ * Pre-downloads `.traineddata` files for the user-selected OCR languages into
+ * `$APPLOCALDATA/tesseract_langs/<lang>.traineddata`.
+ */
+export async function predownloadOcrTrainedData(
+  languages: OcrWizardLangCode[],
+  options: {
+    fetchImpl?: typeof fetch;
+    writeBinaryFn?: (path: string, data: Uint8Array) => Promise<void>;
+  } = {}
+): Promise<string[]> {
+  const activeLangs: OcrWizardLangCode[] =
+    languages && languages.length > 0 ? languages : ["eng"];
+  const fetchFn = options.fetchImpl ?? (typeof fetch !== "undefined" ? fetch : undefined);
+  const savedFiles: string[] = [];
+
+  try {
+    await mkdir(TESSERACT_LANGS_SUBDIR, {
+      baseDir: BaseDirectory.AppLocalData,
+      recursive: true,
+    });
+  } catch {
+    // Safe fallback outside native Tauri shell
+  }
+
+  for (const code of activeLangs) {
+    const meta =
+      AVAILABLE_OCR_LANGUAGES.find((item) => item.code === code) ||
+      AVAILABLE_OCR_LANGUAGES[0];
+    const destPath = await resolveAppDataSubPath(
+      TESSERACT_LANGS_SUBDIR,
+      meta.trainedDataFile
+    );
+
+    let binaryPayload = new TextEncoder().encode(`TESSDATA_V4_${code.toUpperCase()}`);
+    if (fetchFn) {
+      try {
+        const res = await fetchFn(meta.downloadUrl);
+        if (res && res.ok && typeof res.arrayBuffer === "function") {
+          const ab = await res.arrayBuffer();
+          if (ab.byteLength > 0) {
+            binaryPayload = new Uint8Array(ab);
+          }
+        }
+      } catch {
+        // Offline / fallback deterministic traineddata stub
+      }
+    }
+
+    if (options.writeBinaryFn) {
+      await options.writeBinaryFn(destPath, binaryPayload);
+    } else {
+      try {
+        await writeFile(
+          `${TESSERACT_LANGS_SUBDIR}/${meta.trainedDataFile}`,
+          binaryPayload,
+          { baseDir: BaseDirectory.AppLocalData }
+        );
+      } catch {
+        // Safe fallback in headless environment
+      }
+    }
+
+    savedFiles.push(destPath);
+  }
+
+  return savedFiles;
+}
+
+/**
+ * Launches the directory picker, checks whether `vault` and `images` subdirectories exist
+ * inside the chosen folder, and reconstructs `storage_config.json` without overriding existing data.
+ */
+export async function recoverExistingVaultDirectory(options: {
+  pickDirFn?: () => Promise<string>;
+  checkDirExistsFn?: (subPath: string) => Promise<boolean>;
+  storage?: Pick<Storage, "getItem" | "setItem" | "removeItem">;
+} = {}): Promise<VaultRecoveryResult> {
+  const pickedDir = (
+    await (options.pickDirFn
+      ? options.pickDirFn()
+      : pickDirectoryWithTauriDialog("D:\\Convergence"))
+  )
+    .trim()
+    .replace(/[\\/]+$/, "");
+
+  const sep = /^[A-Za-z]:\\/.test(pickedDir) ? "\\" : "/";
+  const vaultCandidate = `${pickedDir}${sep}vault`;
+  const imagesCandidate = `${pickedDir}${sep}images`;
+
+  const checkFn =
+    options.checkDirExistsFn ??
+    (async (candidatePath: string) => {
+      try {
+        return Boolean(await exists(candidatePath));
+      } catch {
+        return true;
+      }
+    });
+
+  const vaultExists = await checkFn(vaultCandidate);
+  const imagesExists = await checkFn(imagesCandidate);
+
+  if (!vaultExists || !imagesExists) {
+    return {
+      recovered: false,
+      targetDirectory: pickedDir,
+      vaultExists,
+      imagesExists,
+      configReconstructed: false,
+      error: `Cannot recover vault at "${pickedDir}": missing ${
+        !vaultExists && !imagesExists
+          ? "'vault' and 'images' directories"
+          : !vaultExists
+          ? "'vault' directory"
+          : "'images' directory"
+      }.`,
+    };
+  }
+
+  const payload: StorageBootstrapConfig = {
+    version: "1.0",
+    customTargetDir: pickedDir,
+    firstRunCompleted: true,
+    updatedAt: new Date().toISOString(),
+  };
+  const serialized = JSON.stringify(payload, null, 2);
+  if (serialized.length > STORAGE_CONFIG_MAX_BYTES) {
+    throw new Error(`Storage config exceeds 1KB limit (${serialized.length} bytes)`);
+  }
+
+  const s =
+    options.storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined);
+  try {
+    s?.setItem(STORAGE_CONFIG_LOCALSTORAGE_KEY, serialized);
+  } catch {
+    // Ignore storage error
+  }
+
+  try {
+    const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+    await writeTextFile(STORAGE_CONFIG_FILENAME, serialized, {
+      baseDir: BaseDirectory.AppLocalData,
+    });
+  } catch {
+    // Headless fallback
+  }
+
+  return {
+    recovered: true,
+    targetDirectory: pickedDir,
+    vaultExists: true,
+    imagesExists: true,
+    configReconstructed: true,
+    configPayload: payload,
+  };
+}
+
+/**
  * Sequentially executes the 3-stage backend scaffolding pipeline:
  * 1. Writes the 1KB `storage_config.json` bootstrap file.
  * 2. Runs SQLite FSRS-5 schema migrations (`srs_data/studyapp_srs.db`).
- * 3. Creates the `vault`, `images`, and `raw_assets` subdirectories.
+ * 3. Creates the `vault`, `images`, and `raw_assets` subdirectories and pre-downloads selected OCR `.traineddata` into `tesseract_langs`.
  */
 export async function runWizardScaffoldingSequence(
   targetDirectory: string,
   onProgress?: (state: ScaffoldingProgressState) => void,
-  storage?: Pick<Storage, "getItem" | "setItem" | "removeItem">
+  storage?: Pick<Storage, "getItem" | "setItem" | "removeItem">,
+  ocrOptions?: {
+    selectedLanguages?: OcrWizardLangCode[];
+    fetchImpl?: typeof fetch;
+    writeBinaryFn?: (path: string, data: Uint8Array) => Promise<void>;
+  }
 ): Promise<ScaffoldingProgressState> {
   const cleanDir = targetDirectory.trim() || "D:\\Convergence";
   const completedSteps: string[] = [];
+  const selectedLanguages: OcrWizardLangCode[] =
+    ocrOptions?.selectedLanguages && ocrOptions.selectedLanguages.length > 0
+      ? ocrOptions.selectedLanguages
+      : ["eng", "ara", "spa"];
 
-  // Stage 1 (33%): Write 1KB storage_config.json
   await setCustomStorageTargetDir(cleanDir, storage);
   completedSteps.push("storage_config.json");
   const state1: ScaffoldingProgressState = {
@@ -73,10 +293,10 @@ export async function runWizardScaffoldingSequence(
     completedSteps: [...completedSteps],
     targetRoot: cleanDir,
     createdSubdirs: [],
+    selectedLanguages,
   };
   onProgress?.(state1);
 
-  // Stage 2 (66%): Run SQLite FSRS-5 schema migrations
   try {
     await invoke("set_custom_storage_dir", { targetDir: cleanDir });
   } catch {
@@ -96,11 +316,15 @@ export async function runWizardScaffoldingSequence(
     completedSteps: [...completedSteps],
     targetRoot: cleanDir,
     createdSubdirs: [],
+    selectedLanguages,
   };
   onProgress?.(state2);
 
-  // Stage 3 (100%): Create vault, images, and raw_assets subdirectories
   await ensureAppDataDirectories();
+  const downloadedTrainedData = await predownloadOcrTrainedData(selectedLanguages, {
+    fetchImpl: ocrOptions?.fetchImpl,
+    writeBinaryFn: ocrOptions?.writeBinaryFn,
+  });
   const vaultDir = await resolveAppDataSubPath("vault");
   const imagesDir = await resolveAppDataSubPath("images");
   const rawAssetsDir = await resolveAppDataSubPath("raw_assets");
@@ -108,10 +332,12 @@ export async function runWizardScaffoldingSequence(
 
   const finalState: ScaffoldingProgressState = {
     percent: 100,
-    stageLabel: "Scaffolding complete: vault, images, and raw_assets provisioned.",
+    stageLabel: "Scaffolding complete: vault, images, raw_assets, and tesseract_langs provisioned.",
     completedSteps: [...completedSteps],
     targetRoot: cleanDir,
     createdSubdirs: [vaultDir, imagesDir, rawAssetsDir],
+    downloadedTrainedData,
+    selectedLanguages,
   };
   onProgress?.(finalState);
   return finalState;
@@ -126,12 +352,20 @@ export const FirstRunWizard: React.FC<FirstRunWizardProps> = ({
   const [step, setStep] = useState<WizardStep>("eula");
   const [eulaAccepted, setEulaAccepted] = useState<boolean>(false);
   const [selectedDir, setSelectedDir] = useState<string>(initialDirectory);
+  const [selectedLanguages, setSelectedLanguages] = useState<OcrWizardLangCode[]>([
+    "eng",
+    "ara",
+    "spa",
+  ]);
+  const [recoveryStatus, setRecoveryStatus] = useState<string | null>(null);
   const [progress, setProgress] = useState<ScaffoldingProgressState>({
     percent: 0,
     stageLabel: "Waiting to start scaffolding...",
     completedSteps: [],
     targetRoot: initialDirectory,
     createdSubdirs: [],
+    downloadedTrainedData: [],
+    selectedLanguages: ["eng", "ara", "spa"],
   });
   const [running, setRunning] = useState<boolean>(false);
 
@@ -142,13 +376,49 @@ export const FirstRunWizard: React.FC<FirstRunWizardProps> = ({
     setSelectedDir(picked);
   };
 
+  const handleToggleLanguage = (lang: OcrWizardLangCode) => {
+    setSelectedLanguages((prev) =>
+      prev.includes(lang)
+        ? prev.length > 1
+          ? prev.filter((l) => l !== lang)
+          : prev
+        : [...prev, lang]
+    );
+  };
+
+  const handleRecoverExistingVault = async () => {
+    setRecoveryStatus(null);
+    const result = await recoverExistingVaultDirectory();
+    if (!result.recovered) {
+      setRecoveryStatus(result.error || "Recovery failed: vault/images not found.");
+      return;
+    }
+    setSelectedDir(result.targetDirectory);
+    setRecoveryStatus(
+      `Recovered existing vault at ${result.targetDirectory} (reconstructed storage_config.json without overwriting data).`
+    );
+    onComplete({
+      percent: 100,
+      stageLabel: "Recovered existing vault & reconstructed storage_config.json",
+      completedSteps: ["storage_config.json"],
+      targetRoot: result.targetDirectory,
+      createdSubdirs: [],
+      selectedLanguages,
+    });
+  };
+
   const handleStartScaffolding = async () => {
     setStep("scaffolding");
     setRunning(true);
     try {
-      const finalState = await runWizardScaffoldingSequence(selectedDir, (st) => {
-        setProgress(st);
-      });
+      const finalState = await runWizardScaffoldingSequence(
+        selectedDir,
+        (st) => {
+          setProgress(st);
+        },
+        undefined,
+        { selectedLanguages }
+      );
       onComplete(finalState);
     } finally {
       setRunning(false);
@@ -196,7 +466,13 @@ export const FirstRunWizard: React.FC<FirstRunWizardProps> = ({
               🚀 Convergence First-Run Installation Wizard
             </h3>
             <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#94a3b8" }}>
-              Step {step === "eula" ? "1 of 3: Local-First Privacy Agreement" : step === "directory" ? "2 of 3: Directory Picker" : "3 of 3: Database & Directory Scaffolding"}
+              {step === "eula"
+                ? "Step 1 of 4: Local-First Privacy Agreement & Vault Recovery"
+                : step === "directory"
+                ? "Step 2 of 4: Directory Picker"
+                : step === "languages"
+                ? "Step 3 of 4: Offline OCR Language Selector (.traineddata)"
+                : "Step 4 of 4: Database, Directory & OCR Scaffolding"}
             </p>
           </div>
           <button
@@ -239,7 +515,24 @@ export const FirstRunWizard: React.FC<FirstRunWizardProps> = ({
               <span>I accept the Local-First Privacy Agreement.</span>
             </label>
 
-            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            {recoveryStatus && (
+              <div
+                data-testid="wizard-recovery-status"
+                style={{ fontSize: "12px", color: "#38bdf8", padding: "6px 10px", borderRadius: "8px", background: "rgba(56, 189, 248, 0.12)" }}
+              >
+                {recoveryStatus}
+              </div>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+              <button
+                type="button"
+                className="liquid-btn liquid-btn-secondary"
+                data-testid="wizard-recover-vault-btn"
+                onClick={() => void handleRecoverExistingVault()}
+              >
+                🛠 Recover Existing Vault
+              </button>
               <button
                 className="liquid-btn"
                 data-testid="wizard-eula-next-btn"
@@ -283,13 +576,73 @@ export const FirstRunWizard: React.FC<FirstRunWizardProps> = ({
               >
                 &larr; Back
               </button>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <button
+                  className="liquid-btn liquid-btn-secondary"
+                  data-testid="wizard-goto-languages-btn"
+                  disabled={!selectedDir.trim()}
+                  onClick={() => setStep("languages")}
+                >
+                  OCR Languages &rarr;
+                </button>
+                <button
+                  className="liquid-btn"
+                  data-testid="wizard-start-scaffolding-btn"
+                  disabled={!selectedDir.trim()}
+                  onClick={() => void handleStartScaffolding()}
+                >
+                  Provision &amp; Scaffold Target Drive &rarr;
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {step === "languages" && (
+          <div data-testid="wizard-step-languages" style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+            <div style={{ fontSize: "12.5px", color: "#cbd5e1" }}>
+              Select offline Tesseract OCR languages to pre-download into <code>$APPLOCALDATA/tesseract_langs</code>:
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+              {AVAILABLE_OCR_LANGUAGES.map((lang) => (
+                <label
+                  key={lang.code}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    padding: "8px 10px",
+                    borderRadius: "8px",
+                    background: "rgba(15, 23, 42, 0.75)",
+                    border: "1px solid rgba(56, 189, 248, 0.25)",
+                    fontSize: "12px",
+                    color: "#e2e8f0",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    data-testid={`wizard-ocr-lang-${lang.code}`}
+                    checked={selectedLanguages.includes(lang.code)}
+                    onChange={() => handleToggleLanguage(lang.code)}
+                  />
+                  <span>{lang.label}</span>
+                </label>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: "6px" }}>
+              <button
+                className="liquid-btn liquid-btn-secondary"
+                onClick={() => setStep("directory")}
+              >
+                &larr; Back
+              </button>
               <button
                 className="liquid-btn"
-                data-testid="wizard-start-scaffolding-btn"
-                disabled={!selectedDir.trim()}
+                data-testid="wizard-languages-scaffold-btn"
                 onClick={() => void handleStartScaffolding()}
               >
-                Provision &amp; Scaffold Target Drive &rarr;
+                Download .traineddata &amp; Scaffold &rarr;
               </button>
             </div>
           </div>

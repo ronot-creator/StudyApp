@@ -1,0 +1,33 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "ai-webview-lockdown",
+  "description": "Strict capability profile for persist:ai_* partitions that ONLY allows resolve_shorthand_query and denies all fs, shell, and dialog plugin accesses.",
+  "windows": [
+    "ai_panel_*",
+    "ai_float_*"
+  ],
+  "webviews": [
+    "ai_panel_*",
+    "ai_float_*"
+  ],
+  "partitions": [
+    "persist:ai_*"
+  ],
+  "permissions": [
+    "allow-resolve-shorthand-query"
+  ],
+  "deny": [
+    "fs:default",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-read-text-file",
+    "fs:allow-write-text-file",
+    "shell:default",
+    "shell:allow-open",
+    "shell:allow-execute",
+    "shell:allow-spawn",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save"
+  ]
+}

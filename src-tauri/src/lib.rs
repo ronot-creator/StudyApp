@@ -16,8 +16,6 @@ pub const HIGHLIGHT_BRIDGE_URL: &str = "http://127.0.0.1:47821/highlight";
 pub const WEBVIEW2_RAM_DIET_ARGS: &str =
     "--process-per-site --enable-features=msWebView2BrowserHitTransparent --js-flags=--max-old-space-size=512";
 
-/// Lightweight MutationObserver injected into AI WebViews to auto-click "Allow" on Composio MCP tool prompts
-/// and disable heavy background CSS animations to conserve GPU/RAM.
 /// Embedded Preload Command Bridge (`src-tauri/src/preload.js`) injected into all AI WebViews
 pub const PRELOAD_BRIDGE_SCRIPT: &str = include_str!("preload.js");
 
@@ -100,10 +98,10 @@ impl SidecarCommandExt for Command {
     }
 }
 
-/// Resolves the dynamic OS `$APPLOCALDATA` root directory for Convergence.
-/// Uses Tauri v2's `app.path().app_local_data_dir()` when an `AppHandle` is provided,
-/// or resolves via OS environment variables (`CONVERGENCE_APPDATA_DIR` / `LOCALAPPDATA` / `XDG_DATA_HOME`).
-pub fn resolve_app_local_data_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
+pub const STORAGE_CONFIG_FILENAME: &str = "storage_config.json";
+pub const MAX_STORAGE_CONFIG_BYTES: usize = 1024;
+
+pub fn resolve_standard_os_appdata_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
     if let Some(handle) = app {
         if let Ok(dir) = handle.path().app_local_data_dir() {
             return dir;
@@ -137,7 +135,32 @@ pub fn resolve_app_local_data_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
     std::env::temp_dir().join("com.convergence.studyapp")
 }
 
-/// Resolves the persistent WebView profile directory inside `$APPLOCALDATA/.webview_partitions/persist_study_session`.
+pub fn read_custom_drive_from_bootstrap(standard_dir: &Path) -> Option<PathBuf> {
+    let cfg_path = standard_dir.join(STORAGE_CONFIG_FILENAME);
+    let metadata = std::fs::metadata(&cfg_path).ok()?;
+    if metadata.len() as usize > MAX_STORAGE_CONFIG_BYTES {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let target = parsed.get("customTargetDir")?.as_str()?.trim();
+    if target.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(target))
+    }
+}
+
+/// Resolves the dynamic OS `$APPLOCALDATA` root directory for Convergence.
+/// Checks the 1KB `storage_config.json` bootstrap file first before falling back to OS `$APPLOCALDATA`.
+pub fn resolve_app_local_data_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
+    let standard = resolve_standard_os_appdata_dir(app);
+    if let Some(custom_drive) = read_custom_drive_from_bootstrap(&standard) {
+        return custom_drive;
+    }
+    standard
+}
+
 pub fn sanitize_ai_slug(raw: &str) -> String {
     let slug: String = raw
         .trim()
@@ -168,7 +191,7 @@ pub fn resolve_study_session_partition_dir(app: Option<&tauri::AppHandle>) -> Pa
         .join("persist_study_session")
 }
 
-/// Automatically creates `vault`, `images`, `srs_data`, and `.webview_partitions/persist_study_session`
+/// Automatically creates `vault`, `images`, `raw_assets`, `srs_data`, `tesseract_langs`, and `.webview_partitions/persist_study_session`
 /// inside `$APPLOCALDATA` on startup if they are missing.
 pub fn ensure_appdata_subdirs(base_dir: &Path) -> Result<(), String> {
     for sub in [
@@ -186,7 +209,6 @@ pub fn ensure_appdata_subdirs(base_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Tracks the bundled MCP Sidecar process, resolved `$APPLOCALDATA` root, and Warm-1 Active Docked AI WebView state
 pub struct AppRuntimeState {
     pub mcp_sidecar: Mutex<Option<Child>>,
     pub active_docked_provider: Mutex<Option<String>>,
@@ -208,13 +230,12 @@ impl Default for AppRuntimeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiPanelStatus {
     pub provider: String,
-    pub mode: String, // "docked" | "detached" | "hibernated"
+    pub mode: String,
     pub label: String,
     pub target_url: String,
     pub partition_dir: String,
 }
 
-/// Resolves canonical or custom AI provider identifier + optional custom URL to `(panel_label, float_label, url, title)`.
 pub fn resolve_ai_provider_with_url(
     provider: &str,
     custom_url: Option<&str>,
@@ -328,7 +349,6 @@ fn canonicalize_lenient(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Validates that a (relative or absolute) path resolves strictly inside the dynamic `$APPLOCALDATA` sandbox.
 pub fn enforce_appdata_sandbox_with_root(base_dir: &Path, candidate: &Path) -> Result<PathBuf, String> {
     let _ = std::fs::create_dir_all(base_dir);
     let root = std::fs::canonicalize(base_dir)
@@ -354,10 +374,158 @@ pub fn enforce_appdata_sandbox(candidate: &Path) -> Result<PathBuf, String> {
     enforce_appdata_sandbox_with_root(&base, candidate)
 }
 
-/// Embedded canonical schema (MyFiles/srs_data/schema.sql)
+/// Strict shorthand query validator for `resolve_shorthand_query`.
+/// Accepts ONLY predefined shorthand syntax (`/q[smwt]* <topic>`, `/u[ade]* <topic>`, `/vault <topic>`, `/context <topic>`, `[[<topic>]]`, or plain alphanumeric topic tokens)
+/// and rejects any payload containing relative path traversal (`..`), slashes (`/`, `\`), drive colons (`:`), or file extensions.
+pub fn validate_shorthand_query_payload(raw_query: &str) -> Result<String, String> {
+    let trimmed = raw_query.trim();
+    if trimmed.is_empty() {
+        return Err("Shorthand query cannot be empty.".to_string());
+    }
+    if trimmed.contains("..")
+        || trimmed.contains('\\')
+        || trimmed.contains(':')
+        || trimmed.contains('\0')
+        || trimmed.contains('~')
+    {
+        return Err(
+            "Convergence Security Lockdown: Arbitrary file paths and traversal sequences are forbidden in resolve_shorthand_query."
+                .to_string(),
+        );
+    }
+
+    let topic = if let Some(rest) = trimmed.strip_prefix("[[") {
+        rest.strip_suffix("]]").unwrap_or(rest).trim()
+    } else if let Some(rest) = trimmed.strip_prefix('/') {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+        let is_valid_cmd = cmd == "q"
+            || cmd == "vault"
+            || cmd == "context"
+            || cmd == "u"
+            || (cmd.starts_with('q') && cmd[1..].chars().all(|c| matches!(c, 's' | 'm' | 'w' | 't')))
+            || (cmd.starts_with('u') && cmd[1..].chars().all(|c| matches!(c, 'a' | 'd' | 'e')));
+        if !is_valid_cmd {
+            return Err(format!(
+                "Convergence Security Lockdown: Unrecognized shorthand command '/{cmd}'."
+            ));
+        }
+        arg
+    } else {
+        trimmed
+    };
+
+    if topic.is_empty() || topic.len() > 120 {
+        return Err("Shorthand topic must be between 1 and 120 characters.".to_string());
+    }
+
+    if topic.contains('/') || topic.contains('\\') || topic.contains("..") {
+        return Err(
+            "Convergence Security Lockdown: Path separators are forbidden inside shorthand query topics."
+                .to_string(),
+        );
+    }
+
+    let lower = topic.to_lowercase();
+    for forbidden_ext in [".md", ".pdf", ".db", ".sqlite", ".json", ".env", ".exe"] {
+        if lower.ends_with(forbidden_ext) || lower.contains(&format!("{forbidden_ext} ")) {
+            return Err(
+                "Convergence Security Lockdown: Direct filename lookups are forbidden in resolve_shorthand_query."
+                    .to_string(),
+            );
+        }
+    }
+
+    let valid_chars = topic
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '-' | '?'));
+    if !valid_chars {
+        return Err(
+            "Convergence Security Lockdown: Topic failed predefined shorthand regex validation."
+                .to_string(),
+        );
+    }
+
+    Ok(topic.to_string())
+}
+
+/// Sanitizes an incoming asset filename by stripping all relative path modifiers (`..`)
+/// and directory separators (`/`, `\`), guaranteeing a pure basename.
+pub fn sanitize_raw_asset_filename(incoming_name: &str) -> Result<String, String> {
+    let without_null = incoming_name.replace('\0', "");
+    let replaced_seps = without_null.replace('\\', "/");
+    let mut cleaned = replaced_seps;
+    while cleaned.contains("..") {
+        cleaned = cleaned.replace("..", "");
+    }
+    let basename = cleaned
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .last()
+        .unwrap_or("")
+        .trim_start_matches('.')
+        .trim();
+
+    let safe: String = basename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    if safe.is_empty() || safe == "." || safe == ".." {
+        return Err("Invalid or empty filename after path-traversal sanitization.".to_string());
+    }
+    Ok(safe)
+}
+
+/// Enforces path traversal sanitization at the Rust layer before `std::fs::copy` is executed,
+/// verifying that the destination path resolves strictly as a direct child of `$APPLOCALDATA/raw_assets`.
+pub fn copy_to_raw_assets_sandboxed(
+    base_dir: &Path,
+    source_path: &Path,
+    incoming_filename: &str,
+) -> Result<PathBuf, String> {
+    ensure_appdata_subdirs(base_dir)?;
+    let safe_filename = sanitize_raw_asset_filename(incoming_filename)?;
+    let raw_assets_dir = enforce_appdata_sandbox_with_root(base_dir, &base_dir.join("raw_assets"))?;
+    let target_path = raw_assets_dir.join(&safe_filename);
+
+    if target_path.parent() != Some(raw_assets_dir.as_path()) {
+        return Err(format!(
+            "Convergence Sandbox Violation: Target {:?} is not a direct child of {:?}",
+            target_path, raw_assets_dir
+        ));
+    }
+    let verified_target = enforce_appdata_sandbox_with_root(base_dir, &target_path)?;
+    if verified_target.parent() != Some(raw_assets_dir.as_path()) {
+        return Err(
+            "Convergence Sandbox Violation: Resolved asset path escaped raw_assets parent."
+                .to_string(),
+        );
+    }
+
+    if source_path.exists() {
+        std::fs::copy(source_path, &verified_target)
+            .map_err(|e| format!("Failed to copy asset to raw_assets: {e}"))?;
+    }
+    Ok(verified_target)
+}
+
+#[tauri::command]
+fn copy_ingested_raw_asset(
+    app: tauri::AppHandle,
+    source_path: String,
+    file_name: String,
+) -> Result<String, String> {
+    let base_dir = resolve_app_local_data_dir(Some(&app));
+    let dest = copy_to_raw_assets_sandboxed(&base_dir, Path::new(&source_path), &file_name)?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
 const SCHEMA_SQL: &str = include_str!("../../MyFiles/srs_data/schema.sql");
 
-/// Applies `schema.sql` to `$APPLOCALDATA/srs_data/studyapp_srs.db` with foreign keys enabled.
 pub fn init_database_at(base_dir: &Path) -> Result<PathBuf, String> {
     ensure_appdata_subdirs(base_dir)?;
     let dir = base_dir.join("srs_data");
@@ -397,7 +565,6 @@ pub fn init_database() -> Result<(), String> {
     init_database_at(&base).map(|_| ())
 }
 
-/// Spawns the bundled `mcp-sidecar` binary on startup using `Command::new_sidecar("mcp-sidecar")` bound to port 1420.
 fn spawn_mcp_sidecar(app_data_dir: &Path) -> Option<Child> {
     if let Ok(mut cmd) = Command::new_sidecar("mcp-sidecar") {
         cmd.args(["--sidecar", "--port", &MCP_SIDECAR_PORT.to_string()])
@@ -412,7 +579,6 @@ fn spawn_mcp_sidecar(app_data_dir: &Path) -> Option<Child> {
         }
     }
 
-    // Development fallback if running unbundled from source checkout
     let dev_server = PathBuf::from("mcp-server/src/server.py");
     if dev_server.exists() {
         return Command::new("python3")
@@ -435,15 +601,11 @@ fn resolve_shorthand_query(
     app: tauri::AppHandle,
     query: String,
 ) -> Result<serde_json::Value, String> {
+    let cleaned_topic_owned = validate_shorthand_query_payload(&query)?;
+    let cleaned_topic = cleaned_topic_owned.as_str();
     let app_data_dir = resolve_app_local_data_dir(Some(&app));
     let _ = ensure_appdata_subdirs(&app_data_dir);
     let vault_dir = app_data_dir.join("vault");
-    let cleaned_topic = query
-        .trim()
-        .trim_start_matches("/q ")
-        .trim_start_matches("/vault ")
-        .trim_start_matches("/context ")
-        .trim();
     let mut matched_files: Vec<String> = Vec::new();
     let mut excerpts: Vec<String> = Vec::new();
     let lower_topic = cleaned_topic.to_lowercase();
@@ -592,10 +754,7 @@ fn append_webview_footnote(
     let note_path = base_dir.join("vault").join("Renal.md");
     let existing = std::fs::read_to_string(&note_path).unwrap_or_default();
     let footnote_line = format!(
-        "
-
-[^webview]: {} (Source: {})
-",
+        "\n\n[^webview]: {} (Source: {})\n",
         selected_text.trim(),
         source_url.unwrap_or_else(|| "external-webview".to_string())
     );
@@ -999,6 +1158,7 @@ pub fn run() {
             update_active_highlight,
             get_mcp_sidecar_status,
             resolve_shorthand_query,
+            copy_ingested_raw_asset,
             spawn_custom_ai_panel,
             get_storage_config,
             set_custom_storage_dir,
@@ -1026,5 +1186,14 @@ mod sandbox_tests {
         let _ = ensure_appdata_subdirs(&base);
         assert!(enforce_appdata_sandbox_with_root(&base, Path::new("../secrets.txt")).is_err());
         assert!(enforce_appdata_sandbox_with_root(&base, Path::new("vault/../../outside.md")).is_err());
+    }
+
+    #[test]
+    fn validates_shorthand_queries_and_sanitizes_raw_asset_filenames() {
+        assert!(validate_shorthand_query_payload("/q renal autoregulation").is_ok());
+        assert!(validate_shorthand_query_payload("[[Macula Densa]]").is_ok());
+        assert!(validate_shorthand_query_payload("../../secrets").is_err());
+        assert!(validate_shorthand_query_payload("vault/Renal.md").is_err());
+        assert_eq!(sanitize_raw_asset_filename("../../parent/Renal_Notes.pdf").unwrap(), "Renal_Notes.pdf");
     }
 }

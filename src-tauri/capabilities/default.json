@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for Convergence main shell, MCP sidecar, and unlimited persistent study_session native AI WebViews scoped to $APPLOCALDATA/**",
+  "description": "Capabilities for Convergence main shell, MCP sidecar, and locked-down persist:ai_* WebViews scoped to $APPLOCALDATA/**",
   "windows": [
     "main",
     "ai_panel_*",
@@ -74,9 +74,47 @@
       ]
     },
     "allow-resolve-shorthand-query",
+    "allow-copy-ingested-raw-asset",
     "allow-spawn-custom-ai-panel",
     "allow-get-storage-config",
     "allow-set-custom-storage-dir",
     "allow-append-webview-footnote"
-  ]
+  ],
+  "profiles": {
+    "persist:ai_*": {
+      "identifier": "persist-ai-webview-lockdown",
+      "description": "Strict IPC lockdown profile for persist:ai_* dynamic AI WebView partitions: ONLY allows resolve_shorthand_query and denies all fs, shell, and dialog plugin accesses.",
+      "windows": [
+        "ai_panel_*",
+        "ai_float_*",
+        "persist:ai_*"
+      ],
+      "webviews": [
+        "ai_panel_*",
+        "ai_float_*",
+        "persist:ai_*"
+      ],
+      "allow": [
+        "resolve_shorthand_query",
+        "allow-resolve-shorthand-query"
+      ],
+      "deny": [
+        "fs:default",
+        "fs:allow-read-file",
+        "fs:allow-write-file",
+        "fs:allow-read-text-file",
+        "fs:allow-write-text-file",
+        "fs:allow-app-local-data-recursive",
+        "fs:allow-mkdir",
+        "fs:allow-exists",
+        "shell:default",
+        "shell:allow-open",
+        "shell:allow-execute",
+        "shell:allow-spawn",
+        "dialog:default",
+        "dialog:allow-open",
+        "dialog:allow-save"
+      ]
+    }
+  }
 }

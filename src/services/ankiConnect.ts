@@ -1,9 +1,24 @@
 import { SrsCard } from "../types/study";
 import { GemmaFsrsCardPayload } from "./aiStudio";
+import {
+  enqueueCardsIntoSrsSyncQueue,
+  getSrsSyncQueueCount,
+  getSrsSyncQueueRows,
+  SqliteAdapter,
+  SRS_SYNC_QUEUE_DROP_OLDEST_COUNT,
+  SRS_SYNC_QUEUE_HARD_LIMIT,
+  SRS_SYNC_QUEUE_LIMIT,
+} from "../lib/db";
 
 export const ANKI_CONNECT_URL = "http://127.0.0.1:8765";
 export const ANKI_CONNECT_VERSION = 6;
 export const DEFAULT_CONVERGENCE_DECK = "Convergence";
+
+export {
+  SRS_SYNC_QUEUE_LIMIT,
+  SRS_SYNC_QUEUE_HARD_LIMIT,
+  SRS_SYNC_QUEUE_DROP_OLDEST_COUNT,
+};
 
 export interface AnkiConnectRequestPayload {
   action: string;
@@ -36,6 +51,44 @@ export interface AnkiSyncSummary {
   totalSubmitted: number;
   addedNoteIds: Array<number | null>;
   succeededCount: number;
+  queuedOffline?: boolean;
+  queuedCount?: number;
+  totalQueueSize?: number;
+  evictedCount?: number;
+  bannerMessage?: string;
+}
+
+export interface AnkiQueueBannerState {
+  queuedCount: number;
+  lastError: string | null;
+  bannerMessage: string | null;
+}
+
+type AnkiQueueListener = (state: AnkiQueueBannerState) => void;
+const ankiQueueListeners = new Set<AnkiQueueListener>();
+let latestBannerState: AnkiQueueBannerState = {
+  queuedCount: 0,
+  lastError: null,
+  bannerMessage: null,
+};
+
+export function getAnkiQueueBannerState(): AnkiQueueBannerState {
+  return latestBannerState;
+}
+
+export function onAnkiSyncQueueChange(listener: AnkiQueueListener): () => void {
+  ankiQueueListeners.add(listener);
+  listener(latestBannerState);
+  return () => {
+    ankiQueueListeners.delete(listener);
+  };
+}
+
+function emitAnkiQueueState(state: AnkiQueueBannerState): void {
+  latestBannerState = state;
+  for (const listener of ankiQueueListeners) {
+    listener(state);
+  }
 }
 
 /**
@@ -111,11 +164,20 @@ export async function ensureConvergenceDeckExists(
 
 /**
  * Pushes generated FSRS / Gemma JSON flashcards directly to Anki Desktop via `invoke: 'addNotes'`.
+ * If the fetch to `http://127.0.0.1:8765` fails (e.g., `ECONNREFUSED`), catches the error,
+ * `INSERT`s the JSON cards into `srs_sync_queue`, enforces the queue size cap (dropping the 2,500
+ * oldest rows ordered by `created_at` when exceeded), and updates the UI notification banner.
  */
 export async function pushFlashcardsToAnki(
   cards: Array<SrsCard | GemmaFsrsCardPayload>,
   deckName: string = DEFAULT_CONVERGENCE_DECK,
-  options: { endpoint?: string; fetchImpl?: typeof fetch } = {}
+  options: {
+    endpoint?: string;
+    fetchImpl?: typeof fetch;
+    dbAdapter?: SqliteAdapter;
+    maxQueueRows?: number;
+    dropOldestCount?: number;
+  } = {}
 ): Promise<AnkiSyncSummary> {
   if (!cards || cards.length === 0) {
     return {
@@ -126,8 +188,6 @@ export async function pushFlashcardsToAnki(
       succeededCount: 0,
     };
   }
-
-  const deckId = await ensureConvergenceDeckExists(deckName, options);
 
   const notes: AnkiNoteInput[] = cards.map((card) => {
     const sysTag = String(card.organSystem || "General")
@@ -169,20 +229,70 @@ export async function pushFlashcardsToAnki(
     };
   });
 
-  const addedNoteIds = await invokeAnkiConnect<Array<number | null>>(
-    "addNotes",
-    { notes },
-    options
-  );
+  try {
+    const deckId = await ensureConvergenceDeckExists(deckName, options);
+    const addedNoteIds = await invokeAnkiConnect<Array<number | null>>(
+      "addNotes",
+      { notes },
+      options
+    );
 
-  const succeededCount = (addedNoteIds || []).filter((id) => typeof id === "number" && id > 0)
-    .length;
+    const succeededCount = (addedNoteIds || []).filter(
+      (id) => typeof id === "number" && id > 0
+    ).length;
 
-  return {
-    deckName,
-    deckId,
-    totalSubmitted: notes.length,
-    addedNoteIds: addedNoteIds || [],
-    succeededCount,
-  };
+    const currentQueued = await getSrsSyncQueueCount(options.dbAdapter);
+    emitAnkiQueueState({
+      queuedCount: currentQueued,
+      lastError: null,
+      bannerMessage:
+        currentQueued > 0
+          ? `${currentQueued} flashcard(s) queued in srs_sync_queue awaiting AnkiConnect sync.`
+          : null,
+    });
+
+    return {
+      deckName,
+      deckId,
+      totalSubmitted: notes.length,
+      addedNoteIds: addedNoteIds || [],
+      succeededCount,
+      queuedOffline: false,
+      queuedCount: 0,
+      totalQueueSize: currentQueued,
+    };
+  } catch (err: any) {
+    const enqueueResult = await enqueueCardsIntoSrsSyncQueue(cards, {
+      adapter: options.dbAdapter,
+      maxRows: options.maxQueueRows ?? SRS_SYNC_QUEUE_LIMIT,
+      dropCount: options.dropOldestCount ?? SRS_SYNC_QUEUE_DROP_OLDEST_COUNT,
+    });
+
+    const bannerMessage = `AnkiConnect unreachable (${
+      err?.message || "ECONNREFUSED"
+    }) — queued ${enqueueResult.insertedCount} card(s) in local SQLite srs_sync_queue (${
+      enqueueResult.totalQueued
+    } total queued).`;
+
+    emitAnkiQueueState({
+      queuedCount: enqueueResult.totalQueued,
+      lastError: err?.message || "ECONNREFUSED",
+      bannerMessage,
+    });
+
+    return {
+      deckName,
+      deckId: null,
+      totalSubmitted: notes.length,
+      addedNoteIds: [],
+      succeededCount: 0,
+      queuedOffline: true,
+      queuedCount: enqueueResult.insertedCount,
+      totalQueueSize: enqueueResult.totalQueued,
+      evictedCount: enqueueResult.evictedCount,
+      bannerMessage,
+    };
+  }
 }
+
+export { getSrsSyncQueueCount, getSrsSyncQueueRows };

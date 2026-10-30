@@ -20,7 +20,11 @@ import {
 } from "./components/ui/ApiKeyGuardrailModal";
 import { FirstRunWizard } from "./components/setup/FirstRunWizard";
 import { ensureAppDataDirectories, resolveAppLocalDataRoot } from "./lib/appPaths";
-import { createSrsCard } from "./lib/fsrs";
+import {
+  AnkiQueueBannerState,
+  getAnkiQueueBannerState,
+  onAnkiSyncQueueChange,
+} from "./services/ankiConnect";
 import {
   DEFAULT_CURATED_REPOSITORIES,
   SourcedMedicalAsset,
@@ -43,7 +47,6 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("vault");
   const [mindMapSystem, setMindMapSystem] = useState<OrganSystem>("Renal");
 
-  // Unlimited AI Chatbot Registry (4 default + unlimited user-added chatbots)
   const [aiProviders, setAiProviders] = useState<AiProviderConfig[]>(() =>
     loadSavedAiProviders()
   );
@@ -59,7 +62,6 @@ export default function App() {
     "Warm-1 Native WebView Pool Ready (persist:study_session)"
   );
 
-  // Mini-browser URL bar & "+ Add AI / Chatbot" discovery modal state
   const currentProviderObj: AiProviderConfig =
     aiProviders.find((p) => p.id === activeAiProvider) || aiProviders[0];
   const [miniBrowserUrlInput, setMiniBrowserUrlInput] = useState<string>(
@@ -70,25 +72,27 @@ export default function App() {
   const [chatbotSearchQuery, setChatbotSearchQuery] = useState<string>("");
   const [customChatbotUrl, setCustomChatbotUrl] = useState<string>("");
 
-  // Split-pane geometry state + Enlarge / Maximize AI Panel toggle
   const [leftWidthPct, setLeftWidthPct] = useState<number>(56);
   const [preMaximizeWidthPct, setPreMaximizeWidthPct] = useState<number>(56);
   const [isAiPanelEnlarged, setIsAiPanelEnlarged] = useState<boolean>(false);
   const [isDraggingSplit, setIsDraggingSplit] = useState<boolean>(false);
   const rightPaneRef = useRef<HTMLDivElement | null>(null);
 
-  // Specimen & 3D Sourcing Tab state
   const [specimenSystem, setSpecimenSystem] = useState<OrganSystem>("Renal");
   const [specimenQuery, setSpecimenQuery] = useState<string>("Renal corpuscle PAS histology");
   const [specimenModality, setSpecimenModality] = useState<SpecimenModality>("histology_slide");
   const [sourcedAssets, setSourcedAssets] = useState<SourcedMedicalAsset[]>([]);
   const [isSourcing, setIsSourcing] = useState<boolean>(false);
   const [dbToast, setDbToast] = useState<string | null>(null);
+  const [ankiQueueBanner, setAnkiQueueBanner] = useState<AnkiQueueBannerState>(() =>
+    getAnkiQueueBannerState()
+  );
   const [appDataRoot, setAppDataRoot] = useState<string>("$APPLOCALDATA");
 
   useEffect(() => {
     void ensureAppDataDirectories().then((dir) => setAppDataRoot(dir));
     void resolveAppLocalDataRoot().then((dir) => setAppDataRoot(dir));
+    return onAnkiSyncQueueChange((st) => setAnkiQueueBanner(st));
   }, []);
 
   useEffect(() => {
@@ -103,7 +107,7 @@ export default function App() {
 
   const computeRightPaneBounds = () => {
     const el = rightPaneRef.current;
-    const headerOffset = 92; // Below 48px provider bar + 44px mini-browser address bar
+    const headerOffset = 92;
     if (!el) {
       const winW = window.innerWidth || 1600;
       const winH = window.innerHeight || 960;
@@ -124,7 +128,6 @@ export default function App() {
     };
   };
 
-  // Sync native docked AI WebView bounds whenever window resizes or split ratio changes
   useEffect(() => {
     const syncBounds = async () => {
       const bounds = computeRightPaneBounds();
@@ -164,7 +167,7 @@ export default function App() {
       );
     } catch {
       setAiPanelStatusText(
-        `Selected ${(found?.label || providerId).toUpperCase()} (${targetUrl}) — Native WebView2 binds at runtime on Windows E:\\`
+        `Selected ${(found?.label || providerId).toUpperCase()} (${targetUrl}) — Native WebView2 binds at runtime`
       );
     }
   };
@@ -268,7 +271,6 @@ export default function App() {
     }
   };
 
-  // Dragging split resizer syncs native docked WebView bounds
   useEffect(() => {
     if (!isDraggingSplit) return;
     const onMove = (e: MouseEvent) => {
@@ -308,7 +310,6 @@ export default function App() {
     }
   };
 
-  // Cursor-tracked Aceternity spotlight coordinates
   const handleShellMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     e.currentTarget.style.setProperty("--mouse-x", `${e.clientX}px`);
     e.currentTarget.style.setProperty("--mouse-y", `${e.clientY}px`);
@@ -328,7 +329,6 @@ export default function App() {
         onComplete={(st) => setAppDataRoot(st.targetRoot)}
       />
       <div className="liquid-shell" onMouseMove={handleShellMouseMove}>
-      {/* True Apple iOS 26 Liquid Glass SVG Optical Refraction & Fresnel Specular Filter */}
       <svg
         aria-hidden="true"
         style={{ position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
@@ -390,7 +390,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Top Navigation & Tunnel Telemetry Bar */}
       <header className="liquid-topbar">
         <div className="liquid-brand">
           <span style={{ fontWeight: 700, fontSize: "16px", color: "#f8fafc" }}>
@@ -433,13 +432,34 @@ export default function App() {
         </nav>
 
         <button className="liquid-btn liquid-btn-secondary" data-testid="open-drive-wizard-btn" style={{ padding: "5px 10px", fontSize: "11.5px" }} onClick={() => setShowDriveWizard(true)}>💽 Drive: {appDataRoot}</button>
-          <Omnibar activeTab={activeTab} activeOrganSystem={mindMapSystem} onNavigateTab={(tab) => setActiveTab(tab)} />
-          <TunnelStatus />
+        <Omnibar activeTab={activeTab} activeOrganSystem={mindMapSystem} onNavigateTab={(tab) => setActiveTab(tab)} />
+        <TunnelStatus />
       </header>
 
-      {/* Split-Pane Main Workspace */}
+      {ankiQueueBanner.queuedCount > 0 && (
+        <div
+          role="status"
+          data-testid="anki-sync-queue-banner"
+          className="liquid-card"
+          style={{
+            margin: "8px 16px 0 16px",
+            padding: "8px 14px",
+            borderColor: "rgba(251, 191, 36, 0.55)",
+            background: "rgba(120, 53, 15, 0.35)",
+            fontSize: "12px",
+            color: "#fde68a",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <span>
+            📦 <strong>Anki Offline Sync Queue:</strong> {ankiQueueBanner.queuedCount} flashcard(s) cached in SQLite <code>srs_sync_queue</code> waiting for Anki Desktop (<code>http://127.0.0.1:8765</code>).
+          </span>
+        </div>
+      )}
+
       <div className="liquid-split-workspace">
-        {/* Left Pane: Local-First Study Modules */}
         <section className="liquid-left-pane" style={{ width: `${leftWidthPct}%` }}>
           {activeTab === "vault" && (
             <VaultReader
@@ -509,16 +529,6 @@ export default function App() {
                 </div>
               </div>
 
-              {isSourcing && (
-                <div className="liquid-card" style={{ minHeight: "120px" }}>
-                  <div style={{ display: "flex", flexDirection: "column", gap: "12px", alignItems: "center", justifyContent: "center", padding: "24px" }}>
-                    <div className="liquid-skeleton" style={{ width: "60%", height: "16px", borderRadius: "8px" }} />
-                    <div className="liquid-skeleton" style={{ width: "40%", height: "12px", borderRadius: "6px" }} />
-                    <div className="liquid-skeleton" style={{ width: "80%", height: "120px", borderRadius: "12px" }} />
-                  </div>
-                </div>
-              )}
-
               {sourcedAssets.length > 0 && (
                 <div className="liquid-card">
                   <h4 style={{ margin: "0 0 10px 0", fontSize: "13.5px" }}>
@@ -538,53 +548,6 @@ export default function App() {
                         }}
                       >
                         <strong>{a.descriptiveFilename}</strong> ({a.organSystem} — {a.modality})
-                        {a.sourceUrl && (
-                          <img
-                            src={a.sourceUrl}
-                            alt={a.descriptiveFilename}
-                            style={{
-                              maxWidth: "100%",
-                              maxHeight: "180px",
-                              marginTop: "8px",
-                              borderRadius: "8px",
-                              border: "1px solid rgba(255,255,255,0.1)",
-                              background: "rgba(0,0,0,0.3)",
-                              display: "block",
-                            }}
-                          />
-                        )}
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", color: "#94a3b8", marginTop: "6px", gap: "8px", flexWrap: "wrap" }}>
-                          <span>Credit: {a.sourceCredit} | Occlusion Masks: {a.occlusionBoxes.length}</span>
-                          <button
-                            className="liquid-btn"
-                            style={{ padding: "4px 10px", fontSize: "11.5px" }}
-                            onClick={async () => {
-                              await createSrsCard({
-                                id: `occ_card_${Date.now()}`,
-                                organSystem: a.organSystem,
-                                cardType: "image_occlusion",
-                                questionOrder: 2,
-                                frontPrompt: `Identify the occluded anatomical structures on ${a.descriptiveFilename} (${a.organSystem}):`,
-                                markScheme: a.occlusionBoxes.map((b) => b.label_text).join(" | "),
-                                imageId: a.id,
-                                imagePath: `${appDataRoot.replace(/\\/g, "/")}/images/${a.descriptiveFilename}`,
-                                occlusionBoxesJson: JSON.stringify(a.occlusionBoxes),
-                                stability: 0,
-                                difficulty: 5.0,
-                                elapsedDays: 0,
-                                scheduledDays: 0,
-                                reps: 0,
-                                lapses: 0,
-                                state: 0,
-                                learningStep: 0,
-                                dueDate: new Date().toISOString(),
-                              });
-                              setActiveTab("srs");
-                            }}
-                          >
-                            🃏 Study in FSRS Occlusion Deck
-                          </button>
-                        </div>
                       </div>
                     ))}
                   </div>
@@ -592,24 +555,21 @@ export default function App() {
               )}
 
               <div className="liquid-card">
-                <h4 style={{ margin: "0 0 10px 0", fontSize: "13px", color: "#94a3b8" }}>
-                  Active Curated Repositories (<code>{appDataRoot}/vault/curated_medical_sources.json</code>)
+                <h4 style={{ margin: "0 0 8px 0", fontSize: "13.5px", color: "#38bdf8" }}>
+                  Curated Open-Access Medical Repositories
                 </h4>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", fontSize: "12px" }}>
                   {DEFAULT_CURATED_REPOSITORIES.map((repo) => (
                     <div
-                      key={repo.id}
-                      className="liquid-interactive-tile"
+                      key={repo.name}
                       style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        background: "rgba(15, 23, 42, 0.55)",
+                        padding: "8px 10px",
+                        borderRadius: "8px",
+                        background: "rgba(15, 23, 42, 0.5)",
                         border: "1px solid rgba(255, 255, 255, 0.08)",
-                        fontSize: "12px",
                       }}
                     >
-                      <div style={{ fontWeight: 600, color: "#38bdf8" }}>{repo.name}</div>
-                      <div style={{ color: "#94a3b8", marginTop: "4px" }}>{repo.license_policy}</div>
+                      <strong>{repo.name}</strong> — <span style={{ color: "#94a3b8" }}>{repo.license}</span>
                     </div>
                   ))}
                 </div>
@@ -618,44 +578,48 @@ export default function App() {
           )}
         </section>
 
-        {/* Draggable Split Resizer */}
         <div
-          className={`liquid-resizer ${isDraggingSplit ? "dragging" : ""}`}
+          className="liquid-split-handle"
           onMouseDown={() => setIsDraggingSplit(true)}
-          title="Drag to resize split workspace and native docked AI WebView"
+          title="Drag to resize split-pane & native AI WebView"
         />
 
-        {/* Right Pane: Native Docked AI Web-View Host & Unlimited Chatbot Sidebar */}
         <aside
           ref={rightPaneRef}
           className="liquid-right-pane"
           style={{ width: `${100 - leftWidthPct}%` }}
         >
-          {/* Row 1: Pinned AI Tabs + Overflow Dropdown + "+ Add Chatbot" + Enlarge & Detach */}
-          <div className="liquid-ai-toolbar" style={{ flexWrap: "wrap" }}>
+          <div className="liquid-ai-provider-bar" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px", flexWrap: "wrap" }}>
             <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
               {inlineAiTabs.map((p) => (
-                <button
-                  key={p.id}
-                  className={`liquid-tab-btn ${activeAiProvider === p.id ? "active" : ""}`}
-                  style={{ padding: "5px 11px", fontSize: "12px" }}
-                  onClick={() => void handleSwitchAiProvider(p.id, p.url)}
-                >
-                  {p.label}
-                </button>
+                <div key={p.id} style={{ display: "inline-flex", alignItems: "center", gap: "2px" }}>
+                  <button
+                    className={`liquid-tab-btn ${activeAiProvider === p.id ? "active" : ""}`}
+                    onClick={() => void handleSwitchAiProvider(p.id, p.url)}
+                  >
+                    {p.label}
+                  </button>
+                  {p.isCustom && (
+                    <button
+                      className="liquid-btn liquid-btn-secondary"
+                      style={{ padding: "2px 6px", fontSize: "10px" }}
+                      onClick={() => void handleRemoveCustomChatbot(p.id)}
+                      title={`Remove ${p.label}`}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
               ))}
 
               {overflowAiTabs.length > 0 && (
                 <select
-                  aria-label="More pinned AI chatbots"
                   className="liquid-select"
-                  style={{ width: "auto", minWidth: "135px", padding: "5px 10px", fontSize: "12px" }}
+                  style={{ width: "auto", padding: "4px 8px", fontSize: "12px" }}
                   value={overflowAiTabs.some((p) => p.id === activeAiProvider) ? activeAiProvider : ""}
                   onChange={(e) => {
-                    if (e.target.value) {
-                      const target = aiProviders.find((p) => p.id === e.target.value);
-                      void handleSwitchAiProvider(e.target.value, target?.url);
-                    }
+                    const chosen = overflowAiTabs.find((p) => p.id === e.target.value);
+                    if (chosen) void handleSwitchAiProvider(chosen.id, chosen.url);
                   }}
                 >
                   <option value="" disabled>
@@ -663,195 +627,83 @@ export default function App() {
                   </option>
                   {overflowAiTabs.map((p) => (
                     <option key={p.id} value={p.id}>
-                      📌 {p.label}
+                      {p.label}
                     </option>
                   ))}
                 </select>
               )}
 
               <button
-                className="liquid-btn"
-                style={{ padding: "5px 10px", fontSize: "11.5px" }}
+                className="liquid-btn liquid-btn-secondary"
+                data-testid="spawn-custom-ai-plus-btn"
+                style={{ padding: "4px 9px", fontSize: "12px", fontWeight: 700 }}
                 onClick={() => setShowAddChatbotModal((prev) => !prev)}
-                title="Add and pin any AI chatbot to your persistent study_session sidebar"
+                title="Spawn isolated custom AI WebView (persist:ai_[slug])"
               >
-                + Add Chatbot
+                +
               </button>
             </div>
 
-            <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: "6px" }}>
               <button
                 className="liquid-btn liquid-btn-secondary"
-                style={{ padding: "5px 10px", fontSize: "11.5px" }}
+                style={{ padding: "4px 8px", fontSize: "11.5px" }}
                 onClick={() => void handleToggleEnlargeAiPanel()}
-                title="Enlarge or restore the AI sidebar width"
               >
-                {isAiPanelEnlarged ? "⇔ Restore Split" : "⤢ Enlarge AI Pane"}
+                {isAiPanelEnlarged ? "Restore Split" : "Enlarge AI"}
               </button>
               <button
                 className="liquid-btn liquid-btn-secondary"
-                style={{ padding: "5px 11px", fontSize: "11.5px" }}
+                style={{ padding: "4px 8px", fontSize: "11.5px" }}
                 onClick={() => void handleToggleDetachRedock()}
               >
-                {detachedProviders[activeAiProvider] ? "⬇ Redock Window" : "↗ Detach Floating"}
+                {detachedProviders[activeAiProvider] ? "Re-Dock" : "Pop Out"}
               </button>
             </div>
           </div>
 
-          {/* Row 2: Persistent Mini-Browser Navigation Bar for Sign-In & Custom URL Navigation */}
           <div
             style={{
-              height: "44px",
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              padding: "0 12px",
-              background: "rgba(9, 15, 29, 0.72)",
-              borderBottom: "1px solid rgba(255, 255, 255, 0.1)",
+              display: "grid",
+              gridTemplateColumns: "1fr auto",
+              gap: "6px",
+              padding: "6px 10px",
+              background: "rgba(15, 23, 42, 0.55)",
+              borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
             }}
           >
-            <span
-              className="liquid-badge"
-              style={{
-                background: "rgba(52, 211, 153, 0.14)",
-                color: "#34d399",
-                fontSize: "10.5px",
-                whiteSpace: "nowrap",
-              }}
-              title={`All OAuth logins & session cookies persist in ${appDataRoot}/.webview_partitions/persist_study_session`}
-            >
-              🔒 persist:study_session
-            </span>
             <input
               className="liquid-input"
-              style={{ padding: "5px 10px", fontSize: "12px", flex: 1 }}
+              style={{ padding: "5px 10px", fontSize: "12px" }}
               value={miniBrowserUrlInput}
               onChange={(e) => setMiniBrowserUrlInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void handleNavigateMiniBrowser();
               }}
-              placeholder="Enter AI URL or search query (e.g. https://perplexity.ai or DeepSeek)..."
+              placeholder="Enter AI URL or search query..."
             />
             <button
-              className="liquid-btn"
-              style={{ padding: "5px 11px", fontSize: "11.5px" }}
+              className="liquid-btn liquid-btn-secondary"
+              style={{ padding: "4px 10px", fontSize: "12px" }}
               onClick={() => void handleNavigateMiniBrowser()}
             >
-              Go / Sign In
+              Go
             </button>
-            {currentProviderObj?.isCustom && (
-              <button
-                className="liquid-btn liquid-btn-secondary"
-                style={{
-                  padding: "5px 9px",
-                  fontSize: "11px",
-                  borderColor: "rgba(251, 113, 133, 0.4)",
-                  color: "#fb7185",
-                }}
-                onClick={() => void handleRemoveCustomChatbot(currentProviderObj.id)}
-                title="Unpin custom chatbot"
-              >
-                ✕ Unpin
-              </button>
-            )}
           </div>
 
-          {/* "+ Add Chatbot" Discovery & Pinning Drawer */}
           <AddAiModal
             isOpen={showAddChatbotModal}
-            existingProviders={aiProviders}
+            searchQuery={chatbotSearchQuery}
+            customUrl={customChatbotUrl}
+            candidates={searchCandidates}
+            onSearchQueryChange={setChatbotSearchQuery}
+            onCustomUrlChange={setCustomChatbotUrl}
+            onSelectCandidate={(c) => void handleAddAndPinChatbot(c)}
             onClose={() => setShowAddChatbotModal(false)}
-            onProviderAdded={(updated, added, statusMsg) => {
-              setAiProviders(updated);
-              setActiveAiProvider(added.id);
-              setMiniBrowserUrlInput(added.url);
-              setAiPanelStatusText(statusMsg);
-            }}
           />
-          {false && showAddChatbotModal && (
-            <div
-              className="liquid-card"
-              style={{
-                margin: "12px",
-                padding: "14px",
-                border: "1px solid rgba(56, 189, 248, 0.55)",
-                zIndex: 30,
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                <h4 style={{ margin: 0, fontSize: "13.5px", color: "#38bdf8" }}>
-                  Add &amp; Pin Any AI Chatbot (Unlimited Persistent Sidebar)
-                </h4>
-                <button
-                  className="liquid-btn liquid-btn-secondary"
-                  style={{ padding: "3px 8px", fontSize: "11px" }}
-                  onClick={() => setShowAddChatbotModal(false)}
-                >
-                  Close
-                </button>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1.4fr auto", gap: "8px", marginBottom: "10px" }}>
-                <input
-                  className="liquid-input"
-                  placeholder="Type AI name (e.g. Perplexity, DeepSeek, Grok, OpenEvidence)..."
-                  value={chatbotSearchQuery}
-                  onChange={(e) => setChatbotSearchQuery(e.target.value)}
-                />
-                <input
-                  className="liquid-input"
-                  placeholder="Optional direct URL (auto-resolved if left blank)..."
-                  value={customChatbotUrl}
-                  onChange={(e) => setCustomChatbotUrl(e.target.value)}
-                />
-                <button
-                  className="liquid-btn"
-                  disabled={!chatbotSearchQuery.trim() && !customChatbotUrl.trim()}
-                  onClick={() => {
-                    const topMatch = searchCandidates[0];
-                    void handleAddAndPinChatbot({
-                      label: chatbotSearchQuery.trim() || topMatch?.label || "Custom AI",
-                      url:
-                        customChatbotUrl.trim() ||
-                        topMatch?.url ||
-                        `https://duckduckgo.com/?q=${encodeURIComponent(chatbotSearchQuery + " AI chat")}`,
-                    });
-                  }}
-                >
-                  📌 Search &amp; Pin AI
-                </button>
-              </div>
-
-              <div style={{ fontSize: "11.5px", color: "#94a3b8", marginBottom: "6px" }}>
-                Instant One-Click AI Discovery Results (click any result to open &amp; pin permanently):
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px", maxHeight: "170px", overflowY: "auto" }}>
-                {searchCandidates.slice(0, 8).map((cand) => (
-                  <button
-                    key={cand.id}
-                    className="liquid-interactive-tile"
-                    style={{
-                      textAlign: "left",
-                      padding: "8px 10px",
-                      borderRadius: "9px",
-                      background: "rgba(15, 23, 42, 0.72)",
-                      border: "1px solid rgba(255, 255, 255, 0.12)",
-                      color: "#f8fafc",
-                      cursor: "pointer",
-                      fontSize: "12px",
-                    }}
-                    onClick={() => void handleAddAndPinChatbot(cand)}
-                  >
-                    <div style={{ fontWeight: 600, color: "#38bdf8" }}>+ {cand.label}</div>
-                    <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "2px" }}>
-                      {cand.description}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
 
           <div
+            className="liquid-webview-host"
             style={{
               flex: 1,
               display: "flex",
@@ -861,26 +713,13 @@ export default function App() {
               padding: "24px",
               textAlign: "center",
               color: "#94a3b8",
+              fontSize: "13px",
             }}
           >
-            <div className="liquid-card" style={{ maxWidth: "480px" }}>
-              <h4 style={{ margin: "0 0 8px 0", color: "#38bdf8" }}>
-                Native Tauri Child WebView Host ({(currentProviderObj?.label || activeAiProvider).toUpperCase()})
-              </h4>
-              <p style={{ fontSize: "12.5px", lineHeight: 1.6, margin: "0 0 10px 0" }}>
-                {aiPanelStatusText}
-              </p>
-              <div style={{ fontSize: "12px", color: "#cbd5e1", marginBottom: "10px" }}>
-                Active Endpoint: <code>{currentProviderObj?.url || miniBrowserUrlInput}</code>
-                <br />
-                Pinned Chatbots: <strong>{aiProviders.length}</strong> (Unlimited Capacity)
-              </div>
-              <div style={{ fontSize: "11.5px", color: "#64748b" }}>
-                Partition: <code>{appDataRoot}/.webview_partitions/persist_study_session</code>
-                <br />
-                Zero <code>&lt;iframe&gt;</code> tags • Persistent OAuth Cookies • Auto-Allow MCP MutationObserver Active
-              </div>
-            </div>
+            <strong style={{ color: "#38bdf8", marginBottom: "6px" }}>
+              {currentProviderObj?.label} Native WebView Dock ({currentProviderObj?.partition || "persist:study_session"})
+            </strong>
+            <span>{aiPanelStatusText}</span>
           </div>
         </aside>
       </div>

@@ -47,9 +47,32 @@ export interface FileIngestionOptions {
   onProgress?: (status: string) => void;
 }
 
+/**
+ * Strict path-traversal sanitization function for incoming filenames.
+ * Strips all relative path modifiers (`..`, `../`, `..\`), directory separators (`/`, `\`),
+ * null bytes, and leading dots so no asset can escape `$APPLOCALDATA/raw_assets`.
+ */
+export function sanitizeRawAssetFilename(rawFilename: string): string {
+  const withoutNulls = (rawFilename || "").replace(/\0/g, "");
+  let stripped = withoutNulls.replace(/\\/g, "/");
+  while (stripped.includes("..")) {
+    stripped = stripped.replace(/\.\./g, "");
+  }
+  const segments = stripped
+    .split("/")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s !== "." && s !== "..");
+  const base = (segments.pop() || "")
+    .replace(/[\\/]/g, "")
+    .replace(/^\.+/, "")
+    .replace(/[^a-zA-Z0-9._ -]+/g, "_")
+    .trim();
+  return base || `asset_${Date.now()}.bin`;
+}
+
 export function sanitizeIngestionStem(filename: string): string {
-  const baseName = filename.split(/[\\/]/).pop() || filename;
-  const withoutExt = baseName.replace(/\.[^.]+$/, "");
+  const safeFile = sanitizeRawAssetFilename(filename);
+  const withoutExt = safeFile.replace(/\.[^.]+$/, "");
   const clean = withoutExt
     .trim()
     .replace(/[^a-zA-Z0-9_-]+/g, "_")
@@ -333,31 +356,41 @@ export async function extractImageOcrLocal(
 
 /**
  * Non-destructively copies a file by filesystem path into `$APPLOCALDATA/raw_assets/<filename>`
- * using Tauri's `copyFile` API, processes it in memory through `pdf.js` and `tesseract.js`,
- * and writes strictly the verbatim text output into `$APPLOCALDATA/vault/<stem>.md`.
+ * after stripping all relative path modifiers (`..`) and slashes (`/`, `\`), processes it in memory
+ * through `pdf.js` and `tesseract.js`, and writes strictly the verbatim text output into `$APPLOCALDATA/vault/<stem>.md`.
  */
 export async function ingestFileByPath(
   sourceFilePath: string,
   options: FileIngestionOptions = {}
 ): Promise<IngestedFileResult> {
   await ensureAppDataDirectories();
-  const baseFilename = sourceFilePath.split(/[\\/]/).pop() || `asset_${Date.now()}.pdf`;
+  const rawCandidate = sourceFilePath.split(/[\\/]/).pop() || `asset_${Date.now()}.pdf`;
+  const baseFilename = sanitizeRawAssetFilename(rawCandidate);
   const prefix = options.targetVaultPrefix
     ? `${sanitizeIngestionStem(options.targetVaultPrefix)}_`
     : "";
-  const rawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${prefix}${baseFilename}`;
+  const sanitizedTargetFilename = sanitizeRawAssetFilename(`${prefix}${baseFilename}`);
+  const rawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${sanitizedTargetFilename}`;
   const savedRawAssetPath = await resolveAppDataSubPath(
     RAW_ASSETS_SUBDIR,
-    `${prefix}${baseFilename}`
+    sanitizedTargetFilename
   );
 
   try {
-    await mkdir(RAW_ASSETS_SUBDIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
-    await copyFile(sourceFilePath, rawAssetRelPath, {
-      toPathBaseDir: BaseDirectory.AppLocalData,
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("copy_ingested_raw_asset", {
+      sourcePath: sourceFilePath,
+      fileName: sanitizedTargetFilename,
     });
   } catch {
-    // Fallback if running in headless test environment
+    try {
+      await mkdir(RAW_ASSETS_SUBDIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
+      await copyFile(sourceFilePath, rawAssetRelPath, {
+        toPathBaseDir: BaseDirectory.AppLocalData,
+      });
+    } catch {
+      // Fallback if running in headless test environment
+    }
   }
 
   let fileBytes = new Uint8Array();
@@ -376,9 +409,10 @@ export async function ingestFileByPath(
 }
 
 /**
- * Non-destructively copies a dropped `File` into `$APPLOCALDATA/raw_assets/<filename>`,
- * processes the binary in memory via `pdf.js` and `tesseract.js`, and writes strictly
- * the verbatim extracted text into `$APPLOCALDATA/vault/<stem>.md`.
+ * Non-destructively copies a dropped `File` into `$APPLOCALDATA/raw_assets/<filename>`
+ * after strict path-traversal sanitization (`sanitizeRawAssetFilename`), processes the binary
+ * in memory via `pdf.js` and `tesseract.js`, and writes strictly the verbatim extracted text
+ * into `$APPLOCALDATA/vault/<stem>.md`.
  */
 export async function ingestDroppedFile(
   file: File,
@@ -386,23 +420,23 @@ export async function ingestDroppedFile(
 ): Promise<IngestedFileResult> {
   await ensureAppDataDirectories();
 
-  const filename = file.name || `dropped_${Date.now()}`;
+  const filename = sanitizeRawAssetFilename(file.name || `dropped_${Date.now()}`);
   const lower = filename.toLowerCase();
   const stem = sanitizeIngestionStem(filename);
   const prefix = options.targetVaultPrefix
     ? `${sanitizeIngestionStem(options.targetVaultPrefix)}_`
     : "";
-  const rawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${prefix}${filename}`;
+  const sanitizedTargetFilename = sanitizeRawAssetFilename(`${prefix}${filename}`);
+  const rawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${sanitizedTargetFilename}`;
   const savedRawAssetPath = await resolveAppDataSubPath(
     RAW_ASSETS_SUBDIR,
-    `${prefix}${filename}`
+    sanitizedTargetFilename
   );
   const markdownRelPath = `vault/${prefix}${stem}.md`;
   const savedMarkdownPath = await resolveAppDataSubPath("vault", `${prefix}${stem}.md`);
 
   const bytes = await fileToUint8Array(file);
 
-  // 1. Non-destructively copy original binary into $APPLOCALDATA/raw_assets
   try {
     await mkdir(RAW_ASSETS_SUBDIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
     await writeFile(rawAssetRelPath, bytes, { baseDir: BaseDirectory.AppLocalData });

@@ -1,6 +1,6 @@
 -- ============================================================================
--- StudyApp Canonical 8-Table WAL SQLite Schema
--- Location: E:\StudyApp\MyFiles\srs_data\studyapp_srs.db
+-- StudyApp Canonical WAL SQLite Schema
+-- Location: $APPLOCALDATA/srs_data/studyapp_srs.db
 -- ============================================================================
 
 PRAGMA journal_mode = WAL;
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS srs_cards (
     mcq_options_json TEXT,
     mcq_correct_index INTEGER,
     image_id TEXT REFERENCES medical_images(id) ON DELETE SET NULL,
-    occlusion_Boxes_json TEXT,
+    occlusion_boxes_json TEXT,
     stability REAL NOT NULL DEFAULT 0.0,
     difficulty REAL NOT NULL DEFAULT 5.0,
     elapsed_days INTEGER NOT NULL DEFAULT 0,
@@ -119,3 +119,11 @@ CREATE TABLE IF NOT EXISTS ai_providers (
     is_custom INTEGER NOT NULL DEFAULT 1 CHECK (is_custom IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS srs_sync_queue (
+    id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_srs_sync_queue_created_at ON srs_sync_queue(created_at);
