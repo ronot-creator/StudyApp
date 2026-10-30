@@ -17,8 +17,8 @@ import { Omnibar } from "./components/ui/Omnibar";
 import {
   ApiKeyErrorBoundary,
   ApiKeyGuardrailModal,
-  FirstRunDriveWizard,
 } from "./components/ui/ApiKeyGuardrailModal";
+import { FirstRunWizard } from "./components/setup/FirstRunWizard";
 import { ensureAppDataDirectories, resolveAppLocalDataRoot } from "./lib/appPaths";
 import { createSrsCard } from "./lib/fsrs";
 import {
@@ -321,11 +321,11 @@ export default function App() {
   return (
     <ApiKeyErrorBoundary>
       <ApiKeyGuardrailModal />
-      <FirstRunDriveWizard
+      <FirstRunWizard
         isOpen={showDriveWizard}
-        currentRoot={appDataRoot}
+        initialDirectory={appDataRoot}
         onClose={() => setShowDriveWizard(false)}
-        onDriveUpdated={(nextRoot) => setAppDataRoot(nextRoot)}
+        onComplete={(st) => setAppDataRoot(st.targetRoot)}
       />
       <div className="liquid-shell" onMouseMove={handleShellMouseMove}>
       {/* True Apple iOS 26 Liquid Glass SVG Optical Refraction & Fresnel Specular Filter */}

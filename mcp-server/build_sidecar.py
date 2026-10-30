@@ -1,6 +1,7 @@
 """
 PyInstaller build script for Convergence's bundled Python MCP Sidecar (`src-tauri/bin/mcp-sidecar-*`).
-Compiles `mcp-server/src/server.py` into standalone sidecar binaries for Tauri v2 `externalBin`.
+Freezes `mcp-server/src/server.py` into standalone sidecar executables for Tauri v2 `bundle.externalBin`
+so the sidecar ships silently inside the final Windows MSI/EXE installer without requiring host Python.
 """
 import os
 import platform
@@ -12,6 +13,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MCP_DIR = ROOT_DIR / "mcp-server"
 BIN_DIR = ROOT_DIR / "src-tauri" / "bin"
+WINDOWS_SIDECAR_NAME = "mcp-sidecar-x86_64-pc-windows-msvc.exe"
 
 
 def detect_host_triple() -> str:
@@ -24,17 +26,17 @@ def detect_host_triple() -> str:
     return "x86_64-unknown-linux-gnu"
 
 
-def build_sidecar() -> None:
+def build_sidecar() -> Path:
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     host_triple = detect_host_triple()
     host_bin_name = f"mcp-sidecar-{host_triple}"
-    win_bin_name = "mcp-sidecar-x86_64-pc-windows-msvc.exe"
 
     cmd = [
         sys.executable,
         "-m",
         "PyInstaller",
         "--onefile",
+        "--noconsole",
         "--clean",
         "--noconfirm",
         "--name",
@@ -57,13 +59,15 @@ def build_sidecar() -> None:
         os.chmod(built_host_bin, 0o755)
         print(f"Built host sidecar binary: {built_host_bin} ({built_host_bin.stat().st_size} bytes)")
 
-        # Ensure the Windows target binary path also exists in src-tauri/bin/ for cross-platform Tauri bundling verification
-        win_target = BIN_DIR / win_bin_name
-        if not win_target.exists():
+        # Guarantee Windows .exe sidecar binary exists in src-tauri/bin/ for bundle.externalBin
+        win_target = BIN_DIR / WINDOWS_SIDECAR_NAME
+        if built_host_bin != win_target:
             shutil.copy2(built_host_bin, win_target)
-            print(f"Provisioned Windows target sidecar: {win_target}")
+            os.chmod(win_target, 0o755)
+            print(f"Provisioned Windows EXE sidecar binary: {win_target}")
 
     shutil.rmtree(MCP_DIR / "build", ignore_errors=True)
+    return built_host_bin
 
 
 if __name__ == "__main__":

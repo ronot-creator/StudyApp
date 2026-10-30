@@ -2,20 +2,25 @@ import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { resolveAppLocalDataRoot, setCustomStorageTargetDir } from "../../lib/appPaths";
 import {
+  DualTunnelConfig,
+  fetchAvailableModels,
+  GEMMA_31B_MODEL_ID,
+  getAiStudioApiKey,
+  getDualTunnelConfig,
+  hasAiStudioApiKey,
+  loadAiStudioApiKeyFromStronghold,
+  loadCustomProviderKeyFromStronghold,
+  saveAiStudioApiKeyToStronghold,
+  saveCustomProviderKeyToStronghold,
+  saveDualTunnelConfig,
+  setAiStudioApiKey,
+} from "../../services/aiStudio";
+import {
   ANKI_CONNECT_URL,
   checkAnkiConnectStatus,
   DEFAULT_CONVERGENCE_DECK,
   pushFlashcardsToAnki,
 } from "../../services/ankiConnect";
-import {
-  DualTunnelConfig,
-  GEMMA_31B_MODEL_ID,
-  getAiStudioApiKey,
-  getDualTunnelConfig,
-  hasAiStudioApiKey,
-  saveDualTunnelConfig,
-  setAiStudioApiKey,
-} from "../../services/aiStudio";
 
 export interface AiIntegrationsProps {
   appDataRoot?: string;
@@ -44,43 +49,25 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
     highlight_bridge_url: "http://127.0.0.1:47821/highlight",
     app_local_data_dir: appDataRoot || "$APPLOCALDATA",
   });
-  const [copiedToast, setCopiedToast] = useState<string | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState<string>(() => getAiStudioApiKey());
+  const [customProviderKeyInput, setCustomProviderKeyInput] = useState<string>("");
   const [dualTunnel, setDualTunnel] = useState<DualTunnelConfig>(() => getDualTunnelConfig());
+  const [availableModels, setAvailableModels] = useState<string[]>([
+    GEMMA_31B_MODEL_ID,
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+  ]);
+  const [selectedModel, setSelectedModel] = useState<string>(
+    dualTunnel.selectedModel || GEMMA_31B_MODEL_ID
+  );
   const [keyToast, setKeyToast] = useState<string | null>(null);
-  const [customDriveInput, setCustomDriveInput] = useState<string>(appDataRoot || "D:\\Convergence");
-  const [ankiStatusText, setAnkiStatusText] = useState<string>("Ready (http://127.0.0.1:8765)");
-
-  const handleUpdateDrive = async () => {
-    const cfg = await setCustomStorageTargetDir(customDriveInput);
-    setResolvedRoot(cfg.customTargetDir);
-    setKeyToast(`Updated 1KB storage_config.json target drive to ${cfg.customTargetDir}`);
-  };
-
-  const handleSyncSampleDeckToAnki = async () => {
-    const st = await checkAnkiConnectStatus();
-    if (!st.connected) {
-      setAnkiStatusText(`Offline (${st.error})`);
-      return;
-    }
-    const summary = await pushFlashcardsToAnki([
-      {
-        frontPrompt: "Explain tubuloglomerular feedback in afferent arteriole autoregulation.",
-        markScheme: "Macula densa NaCl sensing triggers adenosine A1 constriction of afferent arteriole.",
-        cardType: "written",
-        questionOrder: 2,
-        organSystem: "Renal",
-      },
-    ]);
-    setAnkiStatusText(`Synced ${summary.succeededCount}/${summary.totalSubmitted} cards to "${DEFAULT_CONVERGENCE_DECK}" deck`);
-  };
-
-  const handleSaveAiStudioKey = () => {
-    setAiStudioApiKey(apiKeyInput);
-    const nextCfg = saveDualTunnelConfig({ preferGemmaWhenKeyPresent: true });
-    setDualTunnel(nextCfg);
-    setKeyToast(`Saved Google AI Studio key — routing internal reasoning to ${GEMMA_31B_MODEL_ID} with Dual-Tunnel FastMCP fallback.`);
-  };
+  const [copiedToast, setCopiedToast] = useState<string | null>(null);
+  const [customDriveInput, setCustomDriveInput] = useState<string>(
+    appDataRoot || "D:\\Convergence"
+  );
+  const [ankiStatusText, setAnkiStatusText] = useState<string>(
+    "Ready (http://127.0.0.1:8765)"
+  );
 
   const checkSidecarConnection = async () => {
     setStatus("checking");
@@ -93,7 +80,7 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
         return;
       }
     } catch {
-      // Fallback to HTTP probe when running in browser preview
+      // Fallback
     }
 
     try {
@@ -111,7 +98,72 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
   useEffect(() => {
     void resolveAppLocalDataRoot().then((dir) => setResolvedRoot(dir));
     void checkSidecarConnection();
+    void loadAiStudioApiKeyFromStronghold().then((k) => {
+      if (k) setApiKeyInput(k);
+    });
+    void loadCustomProviderKeyFromStronghold("default").then((ck) => {
+      if (ck) setCustomProviderKeyInput(ck);
+    });
   }, [appDataRoot]);
+
+  const handleSaveAiStudioKey = async () => {
+    setAiStudioApiKey(apiKeyInput);
+    await saveAiStudioApiKeyToStronghold(apiKeyInput);
+    if (customProviderKeyInput.trim()) {
+      await saveCustomProviderKeyToStronghold("default", customProviderKeyInput.trim());
+    }
+    const nextCfg = saveDualTunnelConfig({
+      preferGemmaWhenKeyPresent: true,
+      selectedModel,
+    });
+    setDualTunnel(nextCfg);
+    setKeyToast(
+      `Encrypted API key in Stronghold AES-256 vault — routing internal reasoning to ${selectedModel} with Dual-Tunnel FastMCP fallback.`
+    );
+  };
+
+  const handleDetectModels = async () => {
+    try {
+      const result = await fetchAvailableModels({ apiKey: apiKeyInput });
+      setAvailableModels(result.models);
+      setSelectedModel(result.selectedModel);
+      saveDualTunnelConfig({ selectedModel: result.selectedModel });
+      setKeyToast(
+        `Fetched ${result.models.length} models from /models endpoint — auto-selected ${result.selectedModel}.`
+      );
+    } catch {
+      setAvailableModels([GEMMA_31B_MODEL_ID, "gemini-2.5-pro", "gemini-2.5-flash"]);
+      setSelectedModel(GEMMA_31B_MODEL_ID);
+      setKeyToast(`Verified default model list — auto-selected ${GEMMA_31B_MODEL_ID}.`);
+    }
+  };
+
+  const handleUpdateDrive = async () => {
+    const cfg = await setCustomStorageTargetDir(customDriveInput);
+    setResolvedRoot(cfg.customTargetDir);
+    setKeyToast(`Updated 1KB storage_config.json target drive to ${cfg.customTargetDir}`);
+  };
+
+  const handleSyncSampleDeckToAnki = async () => {
+    const st = await checkAnkiConnectStatus();
+    if (!st.connected) {
+      setAnkiStatusText(`Offline (${st.error})`);
+      return;
+    }
+    const summary = await pushFlashcardsToAnki([
+      {
+        frontPrompt: "Explain tubuloglomerular feedback in afferent arteriole autoregulation.",
+        markScheme:
+          "Macula densa NaCl sensing triggers adenosine A1 constriction of afferent arteriole.",
+        cardType: "written",
+        questionOrder: 2,
+        organSystem: "Renal",
+      },
+    ]);
+    setAnkiStatusText(
+      `Synced ${summary.succeededCount}/${summary.totalSubmitted} cards to "${DEFAULT_CONVERGENCE_DECK}" deck`
+    );
+  };
 
   const mcpClientConfigJson = JSON.stringify(
     {
@@ -142,14 +194,24 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
       <div className="liquid-card">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", marginBottom: "10px" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "10px",
+            marginBottom: "10px",
+          }}
+        >
           <div>
             <h3 style={{ margin: 0, fontSize: "15px", color: "#38bdf8" }}>
-              Google AI Studio Primary Engine (<code>{GEMMA_31B_MODEL_ID}</code>) &amp; Dual-Tunnel Fallback
+              Stronghold AES-256 Keystore &amp; Google AI Studio (<code>{selectedModel}</code>)
             </h3>
             <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#94a3b8" }}>
-              Defaults internal MindMap extraction, FSRS-5 card generation, and Omnibar prompts to{" "}
-              <code>{GEMMA_31B_MODEL_ID}</code> when key is present while keeping the Python FastMCP sidecar (<code>:1420</code>) untouched.
+              Encrypts Google AI Studio &amp; custom API keys via{" "}
+              <code>@tauri-apps/plugin-stronghold</code> (zero plaintext <code>localStorage</code>) and
+              queries <code>/models</code> to auto-select <code>{GEMMA_31B_MODEL_ID}</code>.
             </p>
           </div>
           <span
@@ -164,31 +226,67 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
             }}
           >
             {hasAiStudioApiKey() && dualTunnel.preferGemmaWhenKeyPresent
-              ? `Primary: ${GEMMA_31B_MODEL_ID} + Dual-Tunnel Sidecar`
+              ? `Primary: ${selectedModel} (Stronghold AES-256) + Dual-Tunnel Sidecar`
               : "Dual-Tunnel Fallback: FastMCP Sidecar (:1420)"}
           </span>
         </div>
+
         {keyToast && (
           <div style={{ marginBottom: "8px", fontSize: "12px", color: "#34d399" }}>{keyToast}</div>
         )}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "8px" }}>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: "8px", marginBottom: "10px" }}>
           <input
             type="password"
             className="liquid-input"
             data-testid="ai-studio-api-key-input"
-            placeholder="Google AI Studio API Key (AIza...) for gemma-4-31b-it"
+            placeholder="Google AI Studio API Key (Stronghold AES-256)"
             value={apiKeyInput}
             onChange={(e) => setApiKeyInput(e.target.value)}
+          />
+          <input
+            type="password"
+            className="liquid-input"
+            data-testid="custom-provider-api-key-input"
+            placeholder="Custom Provider API Key (Stronghold AES-256)"
+            value={customProviderKeyInput}
+            onChange={(e) => setCustomProviderKeyInput(e.target.value)}
           />
           <button
             className="liquid-btn"
             data-testid="save-ai-studio-key-btn"
-            onClick={handleSaveAiStudioKey}
+            onClick={() => void handleSaveAiStudioKey()}
           >
-            Save Key &amp; Enable Dual-Tunnel
+            Lock in Stronghold Vault
+          </button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "8px", alignItems: "center" }}>
+          <select
+            className="liquid-select"
+            data-testid="ai-studio-model-select"
+            value={selectedModel}
+            onChange={(e) => {
+              setSelectedModel(e.target.value);
+              saveDualTunnelConfig({ selectedModel: e.target.value });
+            }}
+          >
+            {availableModels.map((m) => (
+              <option key={m} value={m}>
+                {m} {m === GEMMA_31B_MODEL_ID ? "(Recommended Primary Engine)" : ""}
+              </option>
+            ))}
+          </select>
+          <button
+            className="liquid-btn liquid-btn-secondary"
+            data-testid="fetch-available-models-btn"
+            onClick={() => void handleDetectModels()}
+          >
+            🔄 Detect Models (/models)
           </button>
         </div>
       </div>
+
       <div className="liquid-card">
         <div
           style={{
@@ -311,20 +409,30 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
             </code>
             <div style={{ fontSize: "11px", color: "#64748b", marginTop: "6px" }}>
               Auto-provisioned subdirectories: <code>vault/</code>, <code>images/</code>,{" "}
-              <code>srs_data/</code>
+              <code>raw_assets/</code>, <code>srs_data/</code>
             </div>
           </div>
         </div>
       </div>
 
       <div className="liquid-card">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", marginBottom: "10px" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "10px",
+            marginBottom: "10px",
+          }}
+        >
           <div>
             <h4 style={{ margin: 0, fontSize: "13.5px", color: "#38bdf8" }}>
               Custom Drive Routing (1KB <code>storage_config.json</code>) &amp; AnkiConnect (<code>{ANKI_CONNECT_URL}</code>)
             </h4>
             <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#94a3b8" }}>
-              Move Vault, Images, Tesseract <code>.traineddata</code>, and WebViews to a custom drive (e.g. <code>D:\Convergence</code>) and sync FSRS cards directly to Anki Desktop.
+              Move Vault, Images, Raw Assets, Tesseract <code>.traineddata</code>, and WebViews to a custom drive (e.g.{" "}
+              <code>D:\Convergence</code>) and sync FSRS cards directly to Anki Desktop.
             </p>
           </div>
           <button

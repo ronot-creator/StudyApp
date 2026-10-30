@@ -174,6 +174,7 @@ pub fn ensure_appdata_subdirs(base_dir: &Path) -> Result<(), String> {
     for sub in [
         "vault",
         "images",
+        "raw_assets",
         "srs_data",
         "tesseract_langs",
         ".webview_partitions/persist_study_session",

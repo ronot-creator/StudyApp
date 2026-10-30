@@ -1,4 +1,12 @@
 import { CANONICAL_ORGAN_SYSTEMS, OrganSystem } from "../types/study";
+import {
+  getSecretFromStrongholdCache,
+  loadSecretFromStronghold,
+  saveSecretToStronghold,
+  setSecretInStrongholdCache,
+  STRONGHOLD_AI_STUDIO_KEY_RECORD,
+  STRONGHOLD_CUSTOM_API_KEY_PREFIX,
+} from "./strongholdKeystore";
 
 export const GEMMA_31B_MODEL_ID = "gemma-4-31b-it";
 export const GOOGLE_AI_STUDIO_BASE_URL =
@@ -10,10 +18,6 @@ export const API_NOT_FOUND_CODE = "API_NOT_FOUND";
 export const API_NOT_FOUND_EVENT = "convergence:api-not-found";
 export const KILL_SPINNERS_EVENT = "convergence:kill-loading-spinners";
 
-/**
- * Custom Circuit-Breaker Error thrown immediately when the Google AI Studio API key is empty.
- * Caught by `<ApiKeyGuardrailModal />` / `<ApiKeyErrorBoundary />` to kill loading spinners and prompt the user.
- */
 export class ApiNotFoundError extends Error {
   public readonly code = API_NOT_FOUND_CODE;
 
@@ -44,11 +48,12 @@ export function triggerApiNotFoundGuardrail(reason?: string): never {
 }
 
 export interface DualTunnelConfig {
-  primaryEngine: "gemma-4-31b-it";
+  primaryEngine: string;
   secondaryEngine: "fastmcp-sidecar-and-colab-fleet";
   preferGemmaWhenKeyPresent: boolean;
   mcpSidecarUrl: string;
   colabFallbackUrl: string;
+  selectedModel?: string;
 }
 
 export interface GemmaMindMapTriple {
@@ -79,39 +84,65 @@ export interface OmnibarCanvasMutationResponse {
 }
 
 export const DEFAULT_DUAL_TUNNEL_CONFIG: DualTunnelConfig = {
-  primaryEngine: "gemma-4-31b-it",
+  primaryEngine: GEMMA_31B_MODEL_ID,
   secondaryEngine: "fastmcp-sidecar-and-colab-fleet",
   preferGemmaWhenKeyPresent: true,
   mcpSidecarUrl: "http://localhost:1420/mcp",
   colabFallbackUrl: "",
+  selectedModel: GEMMA_31B_MODEL_ID,
 };
 
+/**
+ * Reads the Google AI Studio API key from the AES-256 encrypted Stronghold vault
+ * (bypassing `window.localStorage`). Supports an optional explicit mock `storage` object for isolated unit tests.
+ */
 export function getAiStudioApiKey(
   storage?: Pick<Storage, "getItem">
 ): string {
-  try {
-    const s = storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined);
-    return (s?.getItem(AI_STUDIO_KEY_STORAGE) || "").trim();
-  } catch {
-    return "";
+  if (storage && (typeof localStorage === "undefined" || storage !== localStorage)) {
+    return (storage.getItem(AI_STUDIO_KEY_STORAGE) || "").trim();
   }
+  return getSecretFromStrongholdCache(STRONGHOLD_AI_STUDIO_KEY_RECORD);
 }
 
+/**
+ * Writes the Google AI Studio API key directly to the AES-256 encrypted Stronghold vault,
+ * bypassing plaintext `window.localStorage`.
+ */
 export function setAiStudioApiKey(
   apiKey: string,
   storage?: Pick<Storage, "setItem" | "removeItem">
 ): void {
-  try {
-    const trimmed = apiKey.trim();
-    const s = storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined);
+  const trimmed = apiKey.trim();
+  if (storage && (typeof localStorage === "undefined" || storage !== localStorage)) {
     if (trimmed) {
-      s?.setItem(AI_STUDIO_KEY_STORAGE, trimmed);
+      storage.setItem(AI_STUDIO_KEY_STORAGE, trimmed);
     } else {
-      s?.removeItem(AI_STUDIO_KEY_STORAGE);
+      storage.removeItem(AI_STUDIO_KEY_STORAGE);
     }
-  } catch {
-    // Ignore
   }
+  setSecretInStrongholdCache(STRONGHOLD_AI_STUDIO_KEY_RECORD, trimmed);
+}
+
+export async function saveAiStudioApiKeyToStronghold(apiKey: string): Promise<void> {
+  await saveSecretToStronghold(STRONGHOLD_AI_STUDIO_KEY_RECORD, apiKey);
+}
+
+export async function loadAiStudioApiKeyFromStronghold(): Promise<string> {
+  return await loadSecretFromStronghold(STRONGHOLD_AI_STUDIO_KEY_RECORD);
+}
+
+export async function saveCustomProviderKeyToStronghold(
+  providerId: string,
+  apiKey: string
+): Promise<void> {
+  await saveSecretToStronghold(`${STRONGHOLD_CUSTOM_API_KEY_PREFIX}${providerId}`, apiKey);
+}
+
+export async function loadCustomProviderKeyFromStronghold(
+  providerId: string
+): Promise<string> {
+  return await loadSecretFromStronghold(`${STRONGHOLD_CUSTOM_API_KEY_PREFIX}${providerId}`);
 }
 
 export function hasAiStudioApiKey(
@@ -156,6 +187,82 @@ export function saveDualTunnelConfig(
   return merged;
 }
 
+/**
+ * Queries the provider's `/models` REST endpoint, parses the returned model list,
+ * and auto-selects `gemma-4-31b-it` if present.
+ */
+export async function fetchAvailableModels(
+  options: {
+    baseUrl?: string;
+    apiKey?: string;
+    fetchImpl?: typeof fetch;
+  } = {}
+): Promise<{ models: string[]; selectedModel: string }> {
+  const fetchFn = options.fetchImpl ?? fetch;
+  const apiKey = (options.apiKey ?? getAiStudioApiKey()).trim();
+  const rawBase = (
+    options.baseUrl || "https://generativelanguage.googleapis.com/v1beta"
+  ).replace(/\/+$/, "");
+
+  const modelsEndpoint = rawBase.endsWith("/models")
+    ? rawBase
+    : `${rawBase}/models`;
+  const urlWithKey =
+    apiKey && modelsEndpoint.includes("generativelanguage.googleapis.com")
+      ? `${modelsEndpoint}?key=${encodeURIComponent(apiKey)}`
+      : modelsEndpoint;
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  if (apiKey && !modelsEndpoint.includes("generativelanguage.googleapis.com")) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const response = await fetchFn(urlWithKey, {
+    method: "GET",
+    headers,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch /models (HTTP ${response.status})`);
+  }
+
+  const payload = await response.json();
+  const rawEntries: Array<Record<string, any> | string> = Array.isArray(payload?.models)
+    ? payload.models
+    : Array.isArray(payload?.data)
+      ? payload.data
+      : Array.isArray(payload)
+        ? payload
+        : [];
+
+  const parsedModels: string[] = [];
+  for (const item of rawEntries) {
+    const rawId =
+      typeof item === "string"
+        ? item
+        : String(item?.id || item?.name || item?.model || "").trim();
+    const cleanId = rawId.replace(/^models\//i, "").trim();
+    if (cleanId && !parsedModels.includes(cleanId)) {
+      parsedModels.push(cleanId);
+    }
+  }
+
+  if (parsedModels.length === 0) {
+    parsedModels.push(GEMMA_31B_MODEL_ID);
+  }
+
+  const selectedModel = parsedModels.includes(GEMMA_31B_MODEL_ID)
+    ? GEMMA_31B_MODEL_ID
+    : parsedModels[0];
+
+  return {
+    models: parsedModels,
+    selectedModel,
+  };
+}
+
 export function parseStrictJsonResponse<T>(rawText: string): T {
   const cleaned = (rawText || "")
     .trim()
@@ -177,14 +284,12 @@ export function parseStrictJsonResponse<T>(rawText: string): T {
   }
 }
 
-/**
- * Low-level Google AI Studio (`gemma-4-31b-it`) client with immediate `API_NOT_FOUND` Circuit Breaker.
- */
 export async function generateWithGemma31b(
   prompt: string,
   systemInstruction?: string,
   options: {
     apiKey?: string;
+    modelId?: string;
     jsonMode?: boolean;
     temperature?: number;
     fetchImpl?: typeof fetch;
@@ -195,8 +300,9 @@ export async function generateWithGemma31b(
     triggerApiNotFoundGuardrail("API_NOT_FOUND: Google AI Studio API key is empty.");
   }
 
+  const modelId = options.modelId || GEMMA_31B_MODEL_ID;
   const fetchFn = options.fetchImpl ?? fetch;
-  const endpoint = `${GOOGLE_AI_STUDIO_BASE_URL}/${GEMMA_31B_MODEL_ID}:generateContent?key=${encodeURIComponent(
+  const endpoint = `${GOOGLE_AI_STUDIO_BASE_URL}/${modelId}:generateContent?key=${encodeURIComponent(
     apiKey
   )}`;
 
@@ -226,7 +332,7 @@ export async function generateWithGemma31b(
   });
 
   if (!response.ok) {
-    throw new Error(`Google AI Studio (${GEMMA_31B_MODEL_ID}) HTTP ${response.status}`);
+    throw new Error(`Google AI Studio (${modelId}) HTTP ${response.status}`);
   }
 
   const data = await response.json();
@@ -400,7 +506,9 @@ export async function executeOmnibarCanvasCommand(
 ): Promise<OmnibarCanvasMutationResponse> {
   const apiKey = (options.apiKey ?? getAiStudioApiKey()).trim();
   if (!apiKey && options.enforceApiKeyGuardrail) {
-    triggerApiNotFoundGuardrail("API_NOT_FOUND: Google AI Studio API key is required for Gemma 31B Omnibar execution.");
+    triggerApiNotFoundGuardrail(
+      "API_NOT_FOUND: Google AI Studio API key is required for Gemma 31B Omnibar execution."
+    );
   }
 
   const localFastMatch = parseConnectCommandLocally(commandPrompt, activeSystem);

@@ -9,6 +9,7 @@ export const STORAGE_CONFIG_LOCALSTORAGE_KEY = "convergence_storage_config_v1";
 export const APP_DATA_SUBDIRS = [
   "vault",
   "images",
+  "raw_assets",
   "srs_data",
   "tesseract_langs",
   ".webview_partitions/persist_study_session",
