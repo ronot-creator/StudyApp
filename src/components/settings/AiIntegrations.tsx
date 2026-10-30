@@ -1,6 +1,15 @@
 import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { resolveAppLocalDataRoot } from "../../lib/appPaths";
+import {
+  DualTunnelConfig,
+  GEMMA_31B_MODEL_ID,
+  getAiStudioApiKey,
+  getDualTunnelConfig,
+  hasAiStudioApiKey,
+  saveDualTunnelConfig,
+  setAiStudioApiKey,
+} from "../../services/aiStudio";
 
 export interface AiIntegrationsProps {
   appDataRoot?: string;
@@ -30,6 +39,16 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
     app_local_data_dir: appDataRoot || "$APPLOCALDATA",
   });
   const [copiedToast, setCopiedToast] = useState<string | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState<string>(() => getAiStudioApiKey());
+  const [dualTunnel, setDualTunnel] = useState<DualTunnelConfig>(() => getDualTunnelConfig());
+  const [keyToast, setKeyToast] = useState<string | null>(null);
+
+  const handleSaveAiStudioKey = () => {
+    setAiStudioApiKey(apiKeyInput);
+    const nextCfg = saveDualTunnelConfig({ preferGemmaWhenKeyPresent: true });
+    setDualTunnel(nextCfg);
+    setKeyToast(`Saved Google AI Studio key — routing internal reasoning to ${GEMMA_31B_MODEL_ID} with Dual-Tunnel FastMCP fallback.`);
+  };
 
   const checkSidecarConnection = async () => {
     setStatus("checking");
@@ -90,6 +109,54 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+      <div className="liquid-card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", marginBottom: "10px" }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: "15px", color: "#38bdf8" }}>
+              Google AI Studio Primary Engine (<code>{GEMMA_31B_MODEL_ID}</code>) &amp; Dual-Tunnel Fallback
+            </h3>
+            <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#94a3b8" }}>
+              Defaults internal MindMap extraction, FSRS-5 card generation, and Omnibar prompts to{" "}
+              <code>{GEMMA_31B_MODEL_ID}</code> when key is present while keeping the Python FastMCP sidecar (<code>:1420</code>) untouched.
+            </p>
+          </div>
+          <span
+            data-testid="dual-tunnel-status"
+            style={{
+              padding: "4px 10px",
+              borderRadius: "999px",
+              fontSize: "11.5px",
+              fontWeight: 600,
+              background: "rgba(56, 189, 248, 0.16)",
+              color: "#38bdf8",
+            }}
+          >
+            {hasAiStudioApiKey() && dualTunnel.preferGemmaWhenKeyPresent
+              ? `Primary: ${GEMMA_31B_MODEL_ID} + Dual-Tunnel Sidecar`
+              : "Dual-Tunnel Fallback: FastMCP Sidecar (:1420)"}
+          </span>
+        </div>
+        {keyToast && (
+          <div style={{ marginBottom: "8px", fontSize: "12px", color: "#34d399" }}>{keyToast}</div>
+        )}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "8px" }}>
+          <input
+            type="password"
+            className="liquid-input"
+            data-testid="ai-studio-api-key-input"
+            placeholder="Google AI Studio API Key (AIza...) for gemma-4-31b-it"
+            value={apiKeyInput}
+            onChange={(e) => setApiKeyInput(e.target.value)}
+          />
+          <button
+            className="liquid-btn"
+            data-testid="save-ai-studio-key-btn"
+            onClick={handleSaveAiStudioKey}
+          >
+            Save Key &amp; Enable Dual-Tunnel
+          </button>
+        </div>
+      </div>
       <div className="liquid-card">
         <div
           style={{

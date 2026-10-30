@@ -12,6 +12,8 @@ import { VaultReader } from "./components/vault/VaultReader";
 import { FsrsRunner } from "./components/srs/FsrsRunner";
 import { MindMapCanvas } from "./components/mindmap/MindMapCanvas";
 import { AiIntegrations } from "./components/settings/AiIntegrations";
+import { AddAiModal } from "./components/ui/AddAiModal";
+import { Omnibar } from "./components/ui/Omnibar";
 import { ensureAppDataDirectories, resolveAppLocalDataRoot } from "./lib/appPaths";
 import { createSrsCard } from "./lib/fsrs";
 import {
@@ -416,7 +418,8 @@ export default function App() {
           </button>
         </nav>
 
-        <TunnelStatus />
+        <Omnibar activeTab={activeTab} activeOrganSystem={mindMapSystem} onNavigateTab={(tab) => setActiveTab(tab)} />
+          <TunnelStatus />
       </header>
 
       {/* Split-Pane Main Workspace */}
@@ -739,7 +742,18 @@ export default function App() {
           </div>
 
           {/* "+ Add Chatbot" Discovery & Pinning Drawer */}
-          {showAddChatbotModal && (
+          <AddAiModal
+            isOpen={showAddChatbotModal}
+            existingProviders={aiProviders}
+            onClose={() => setShowAddChatbotModal(false)}
+            onProviderAdded={(updated, added, statusMsg) => {
+              setAiProviders(updated);
+              setActiveAiProvider(added.id);
+              setMiniBrowserUrlInput(added.url);
+              setAiPanelStatusText(statusMsg);
+            }}
+          />
+          {false && showAddChatbotModal && (
             <div
               className="liquid-card"
               style={{

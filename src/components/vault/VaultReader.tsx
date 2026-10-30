@@ -13,6 +13,11 @@ import { SQLITE_DB_URI } from "../../services/ngrokGrader";
 import { createSrsCard } from "../../lib/fsrs";
 import { resolveAppDataSubPath } from "../../lib/appPaths";
 import {
+  DEFAULT_OCR_LANGUAGE,
+  handleReactDropzoneFiles,
+  IngestedFileResult,
+} from "../../services/ingestion/fileIngestion";
+import {
   appendTripleToVaultMarkdown,
   DEFAULT_SYSTEM_VAULT_MARKDOWN,
   getSafeVaultFilename,
@@ -184,6 +189,9 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
   const [resolvedVaultPath, setResolvedVaultPath] = useState<string>(
     "$APPLOCALDATA/vault/Renal.md"
   );
+  const [isDragOver, setIsDragOver] = useState<boolean>(false);
+  const [ingestingStatus, setIngestingStatus] = useState<string | null>(null);
+  const [recentIngestions, setRecentIngestions] = useState<IngestedFileResult[]>([]);
 
   const activeFilename = `vault/${getSafeVaultFilename(activeSystem)}.md`;
 
@@ -305,6 +313,35 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
     setActionToast(`Inserted Thought Anchor #${anchorId} into ${activeFilename}`);
   };
 
+  const handleDropFiles = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    const dropped = e.dataTransfer?.files;
+    if (!dropped || dropped.length === 0) return;
+
+    setIngestingStatus(`Ingesting ${dropped.length} file(s) locally via pdfjs-dist & tesseract.js (${DEFAULT_OCR_LANGUAGE})...`);
+    try {
+      const results = await handleReactDropzoneFiles(dropped, {
+        ocrLang: DEFAULT_OCR_LANGUAGE,
+        targetVaultPrefix: activeSystem,
+        onProgress: (msg) => setIngestingStatus(msg),
+      });
+      if (results.length > 0) {
+        setRecentIngestions((prev) => [...results, ...prev].slice(0, 5));
+        const mergedText = results.map((r) => r.extractedText).join("\n\n");
+        const nextMd = `${content.trim()}\n\n${mergedText}\n`;
+        await handleContentUpdate(nextMd);
+        setEditorEpoch((n) => n + 1);
+        setActionToast(
+          `Ingested ${results.map((r) => r.originalFilename).join(", ")} into $APPLOCALDATA/vault & $APPLOCALDATA/images (${DEFAULT_OCR_LANGUAGE})`
+        );
+      }
+    } finally {
+      setIngestingStatus(null);
+    }
+  };
+
   const extractedAnchors = parseThoughtAnchors(content);
 
   return (
@@ -386,6 +423,47 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
           </div>
         </div>
       )}
+
+      <div
+        className="liquid-card"
+        data-testid="vault-local-ocr-dropzone"
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragOver(true);
+        }}
+        onDragLeave={() => setIsDragOver(false)}
+        onDrop={(e) => void handleDropFiles(e)}
+        style={{
+          padding: "10px 14px",
+          border: isDragOver
+            ? "1px dashed rgba(56, 189, 248, 0.85)"
+            : "1px dashed rgba(148, 163, 184, 0.35)",
+          background: isDragOver
+            ? "rgba(56, 189, 248, 0.14)"
+            : "rgba(9, 15, 29, 0.42)",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: "8px",
+          fontSize: "12px",
+          color: "#cbd5e1",
+        }}
+      >
+        <div>
+          📥 <strong>Local Drag-and-Drop OCR &amp; PDF Ingestion:</strong> Drop PDFs or Images here to extract via{" "}
+          <code>pdfjs-dist</code> &amp; <code>tesseract.js (lang: &apos;{DEFAULT_OCR_LANGUAGE}&apos;)</code> directly into{" "}
+          <code>$APPLOCALDATA/images</code> &amp; <code>$APPLOCALDATA/vault</code>.
+        </div>
+        {ingestingStatus && (
+          <span style={{ color: "#38bdf8", fontWeight: 600 }}>{ingestingStatus}</span>
+        )}
+        {recentIngestions.length > 0 && !ingestingStatus && (
+          <span style={{ color: "#34d399", fontSize: "11.5px" }}>
+            Last Ingested: {recentIngestions[0].originalFilename} ({recentIngestions[0].ocrLanguage})
+          </span>
+        )}
+      </div>
 
       <div
         className="liquid-card"

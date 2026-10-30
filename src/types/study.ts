@@ -36,6 +36,7 @@ export interface AiProviderConfig {
   url: string;
   pinned: boolean;
   isCustom?: boolean;
+  partition?: string;
 }
 
 export interface OcclusionBox {

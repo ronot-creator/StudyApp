@@ -21,6 +21,12 @@ import { ensureAppDataDirectories, resolveAppDataSubPath } from "../../lib/appPa
 import Database from "@tauri-apps/plugin-sql";
 import { CANONICAL_ORGAN_SYSTEMS, OrganSystem } from "../../types/study";
 import { getNgrokGrader, SQLITE_DB_URI } from "../../services/ngrokGrader";
+import {
+  extractMindMapTriplesWithGemma,
+  GEMMA_31B_MODEL_ID,
+  getDualTunnelConfig,
+  hasAiStudioApiKey,
+} from "../../services/aiStudio";
 
 export interface ParsedTriple {
   id: string;
@@ -734,7 +740,66 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     [handleSelectSystem]
   );
 
+  useEffect(() => {
+    const onOmnibarMutation = (event: Event) => {
+      const custom = event as CustomEvent<{
+        organSystem?: OrganSystem;
+        updatedMarkdown?: string;
+        mutation?: { summary?: string };
+      }>;
+      const detail = custom.detail;
+      if (!detail || !detail.updatedMarkdown) return;
+      if (detail.organSystem && detail.organSystem !== activeSystem) {
+        setInternalSystem(detail.organSystem);
+      }
+      setSyntaxInput(detail.updatedMarkdown);
+      const parsed = parseMarkdownMindMapTriples(
+        detail.organSystem || activeSystem,
+        detail.updatedMarkdown
+      );
+      const savedPos = loadSavedNodePositions(detail.organSystem || activeSystem);
+      const nextGraph = buildGraphFromTriples(parsed, savedPos);
+      setNodes(nextGraph.nodes);
+      setEdges(nextGraph.edges);
+      void persistGraphToSqlite(detail.organSystem || activeSystem, parsed);
+      if (detail.mutation?.summary) {
+        showToast(detail.mutation.summary);
+      }
+    };
+    window.addEventListener("convergence:omnibar-mindmap-update", onOmnibarMutation);
+    return () =>
+      window.removeEventListener("convergence:omnibar-mindmap-update", onOmnibarMutation);
+  }, [activeSystem]);
+
   const handleExtractViaColab = async () => {
+    const dualCfg = getDualTunnelConfig();
+    if (hasAiStudioApiKey() && dualCfg.preferGemmaWhenKeyPresent) {
+      setExtractingColab(true);
+      try {
+        const gemmaTriples = await extractMindMapTriplesWithGemma(syntaxInput, activeSystem);
+        if (gemmaTriples.length > 0) {
+          let nextMd = syntaxInput;
+          for (const t of gemmaTriples) {
+            const targetExpr =
+              t.is_cross_system_bridge && t.target_organ_system
+                ? `${t.target_organ_system}::${t.target_node}`
+                : t.target_node;
+            nextMd = appendTripleToVaultMarkdown(
+              nextMd,
+              `[${t.source_node}] --(${t.linking_phrase})--> [${targetExpr}]`
+            );
+          }
+          handleSyntaxChange(nextMd);
+          showToast(`Extracted ${gemmaTriples.length} triples via ${GEMMA_31B_MODEL_ID}`);
+          setExtractingColab(false);
+          return;
+        }
+      } catch {
+        // Fall through to secondary Colab Fleet tunnel
+      } finally {
+        setExtractingColab(false);
+      }
+    }
     const grader = getNgrokGrader();
     const tunnelUrl = grader.getTunnelUrl();
     if (!tunnelUrl) {

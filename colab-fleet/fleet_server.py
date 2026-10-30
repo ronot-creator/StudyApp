@@ -1,5 +1,7 @@
 """
-StudyApp Colab Pro 3B Micro-Fleet Server (Single Unified Qwen 2.5 3B / Llama 3.2 3B Instance)
+Convergence Legacy Colab Micro-Fleet Server (Archived Secondary / Heavy-OCR Fallback)
+Dynamic domain-agnostic reasoning & OCR fallback with 8-bit GGUF inference (`q8_0`) support.
+All hardcoded medical dummy lists have been stripped; categories and tags are dynamically accepted via request payloads.
 Exposes:
 - GET  /health
 - POST /grade-written
@@ -38,8 +40,10 @@ except ImportError:
     Image = None
 
 BACKEND = os.environ.get("FLEET_BACKEND", "ollama").lower()
-MODEL = os.environ.get("STUDYAPP_3B_MODEL", os.environ.get("FLEET_MODEL", "qwen2.5:3b-instruct"))
+MODEL = os.environ.get("STUDYAPP_3B_MODEL", os.environ.get("FLEET_MODEL", "qwen2.5:3b-instruct-q8_0"))
 MODEL_NAME = MODEL
+GGUF_QUANTIZATION = os.environ.get("FLEET_GGUF_QUANT", "q8_0")
+FLEET_ROLE = "archived_secondary_heavy_ocr_fallback"
 BACKEND_URL = os.environ.get(
     "OLLAMA_BASE_URL",
     os.environ.get("FLEET_BACKEND_URL", "http://127.0.0.1:11434" if BACKEND == "ollama" else "http://127.0.0.1:8000"),
@@ -52,26 +56,7 @@ MAX_LINK_WORDS = 30
 MAX_MARKDOWN_CHUNK_CHARS = 6000
 LLM_TIMEOUT_S = 90
 
-ORGAN_SYSTEMS = [
-    "Renal",
-    "Cardiovascular",
-    "Respiratory",
-    "Gastrointestinal",
-    "Neurological",
-    "Neurology",
-    "Endocrine",
-    "Musculoskeletal",
-    "Reproductive",
-    "Hematological",
-    "Hematology/Oncology",
-    "Immunological",
-    "Immunology",
-    "Integumentary",
-    "Lymphatic",
-    "Multisystem/General",
-]
-
-app = FastAPI(title="StudyApp Colab 3B Micro-Fleet", version="2.1.0")
+app = FastAPI(title="Convergence Colab Fleet (Secondary Heavy-OCR & 8-bit GGUF Fallback)", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -87,7 +72,7 @@ _easyocr_reader = None
 def get_easyocr_reader():
     global _easyocr_reader
     if _easyocr_reader is None and EASYOCR_AVAILABLE:
-        _easyocr_reader = easyocr.Reader(["en"], gpu=False)
+        _easyocr_reader = easyocr.Reader(["en", "ar"], gpu=False)
     return _easyocr_reader
 
 
@@ -98,7 +83,6 @@ def verify_token(x_fleet_token: Optional[str] = None) -> None:
 
 
 def _extract_json(text: str) -> Any:
-    """Parses model output as JSON, tolerating code fences / leading prose."""
     text = (text or "").strip()
     try:
         return json.loads(text)
@@ -111,7 +95,6 @@ def _extract_json(text: str) -> Any:
 
 
 async def llm_json(system: str, user: str) -> Dict[str, Any]:
-    """Calls the local 3B model and returns a parsed JSON object."""
     async with _llm_slots, httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as client:
         if BACKEND == "ollama":
             r = await client.post(
@@ -120,7 +103,7 @@ async def llm_json(system: str, user: str) -> Dict[str, Any]:
                     "model": MODEL,
                     "stream": False,
                     "format": "json",
-                    "options": {"temperature": 0.1, "num_ctx": 4096},
+                    "options": {"temperature": 0.1, "num_ctx": 4096, "quantization": GGUF_QUANTIZATION},
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 },
             )
@@ -142,7 +125,6 @@ async def llm_json(system: str, user: str) -> Dict[str, Any]:
 
 
 async def query_ollama_json(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-    """Compatibility wrapper around llm_json."""
     return await llm_json(system_prompt, user_prompt)
 
 
@@ -156,9 +138,6 @@ async def llm_json_retry(system: str, user: str, attempts: int = 2) -> Dict[str,
     raise HTTPException(status_code=502, detail=f"Model backend failed: {last}")
 
 
-# ----------------------------------------------------------------------------
-# OCR helpers
-# ----------------------------------------------------------------------------
 class OcclusionBox(BaseModel):
     id: str
     label_text: str
@@ -202,12 +181,12 @@ def ocr_image_easyocr(image_bytes: bytes) -> List[dict]:
         return []
 
 
-def ocr_image_tesseract(image_bytes: bytes) -> List[dict]:
+def ocr_image_tesseract(image_bytes: bytes, lang: str = "eng+ara") -> List[dict]:
     if not TESSERACT_AVAILABLE:
         return []
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT)
         ocr_results = []
         for i in range(len(data["text"])):
             text = data["text"][i].strip()
@@ -227,13 +206,13 @@ def ocr_image_tesseract(image_bytes: bytes) -> List[dict]:
         return []
 
 
-def run_ocr_on_image(image_bytes: bytes) -> List[dict]:
+def run_ocr_on_image(image_bytes: bytes, lang: str = "eng+ara") -> List[dict]:
     if EASYOCR_AVAILABLE:
         results = ocr_image_easyocr(image_bytes)
         if results:
             return results
     if TESSERACT_AVAILABLE:
-        return ocr_image_tesseract(image_bytes)
+        return ocr_image_tesseract(image_bytes, lang=lang)
     return []
 
 
@@ -257,15 +236,14 @@ def normalize_boxes_to_pct(ocr_results: List[dict], img_width: int, img_height: 
     return boxes
 
 
-# ----------------------------------------------------------------------------
-# /health
-# ----------------------------------------------------------------------------
 @app.get("/health")
 async def health_check() -> Dict[str, Any]:
     return {
         "status": "ok",
+        "role": FLEET_ROLE,
         "backend": BACKEND,
         "model": MODEL,
+        "gguf_quantization": GGUF_QUANTIZATION,
         "ocr": {
             "easyocr": EASYOCR_AVAILABLE,
             "tesseract": TESSERACT_AVAILABLE,
@@ -273,23 +251,22 @@ async def health_check() -> Dict[str, Any]:
     }
 
 
-# ----------------------------------------------------------------------------
-# /grade-written
-# ----------------------------------------------------------------------------
 class GradeWrittenRequest(BaseModel):
     card_id: Optional[str] = None
     question_prompt: str = Field(..., min_length=1, max_length=4000)
     mark_scheme: str = Field(..., min_length=1, max_length=8000)
     user_answer: str = Field(default="", max_length=8000)
+    categories: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
 
 
-GRADE_SYSTEM = """You are a strict-but-fair medical physiology examiner grading a student's written answer.
-Grade SEMANTIC and PHYSIOLOGICAL understanding against the mark scheme. FORGIVE wording, synonyms, spelling,
+GRADE_SYSTEM = """You are a strict-but-fair examiner grading a student's written answer against a mark scheme.
+Grade SEMANTIC and MECHANISTIC understanding against the mark scheme. FORGIVE wording, synonyms, spelling,
 abbreviations and sentence order; PENALISE wrong mechanisms, reversed causality and missing key concepts.
-Scale: 1 = blank/wrong/contradicts physiology, 2 = major gaps or a significant error, 3 = partly correct with
-important gaps, 4 = mostly correct, minor omissions, 5 = complete and physiologically accurate.
+Scale: 1 = blank/wrong/contradicts mark scheme, 2 = major gaps or a significant error, 3 = partly correct with
+important gaps, 4 = mostly correct, minor omissions, 5 = complete and accurate.
 Reply with ONLY this JSON object:
-{"grade": <integer 1-5>, "physiological_feedback": "<2-4 sentences explaining the physiology>", "missing_concepts": ["<concept from the mark scheme the answer omitted>"]}
+{"grade": <integer 1-5>, "physiological_feedback": "<2-4 sentences explaining the feedback>", "missing_concepts": ["<concept from the mark scheme the answer omitted>"]}
 Use an empty list when nothing is missing."""
 
 
@@ -303,9 +280,10 @@ def normalize_grade(raw: Dict[str, Any], card_id: Optional[str] = None) -> Dict[
     missing = raw.get("missing_concepts") or []
     if isinstance(missing, str):
         missing = [missing]
+    feedback = str(raw.get("physiological_feedback") or raw.get("feedback") or "").strip() or "No feedback returned."
     result: Dict[str, Any] = {
         "grade": max(1, min(5, grade)),
-        "physiological_feedback": str(raw.get("physiological_feedback") or "").strip() or "No feedback returned.",
+        "physiological_feedback": feedback,
         "missing_concepts": [str(c).strip() for c in missing if str(c).strip()],
     }
     if card_id is not None:
@@ -331,8 +309,14 @@ async def grade_written(
             res["evaluator_model"] = MODEL
         return res
 
+    context_prefix = ""
+    if req.categories:
+        context_prefix += f"CATEGORIES: {', '.join(req.categories)}\n"
+    if req.tags:
+        context_prefix += f"TAGS: {', '.join(req.tags)}\n"
+
     user = (
-        f"QUESTION:\n{req.question_prompt}\n\nMARK SCHEME:\n{req.mark_scheme}\n\n"
+        f"{context_prefix}QUESTION:\n{req.question_prompt}\n\nMARK SCHEME:\n{req.mark_scheme}\n\n"
         f"STUDENT ANSWER:\n{req.user_answer}"
     )
     last: Exception = RuntimeError("no attempt")
@@ -345,21 +329,20 @@ async def grade_written(
     raise HTTPException(status_code=502, detail=f"Model returned an invalid grade payload: {last}")
 
 
-# ----------------------------------------------------------------------------
-# /extract-mindmap-triples
-# ----------------------------------------------------------------------------
 class MindMapTriplesRequest(BaseModel):
     markdown: Optional[str] = None
     markdown_text: Optional[str] = None
     organ_system: Optional[str] = None
+    categories: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
 
 
 EXPLICIT_TRIPLE_RE = re.compile(r"\[([^\[\]\n]+?)\]\s*--\(([^()\n]+?)\)-->\s*\[([^\[\]\n]+?)\]")
 
-TRIPLE_SYSTEM = """You extract physiological FLOW relationships from medical lecture notes as concept-map triples.
+TRIPLE_SYSTEM = """You extract causal and conceptual FLOW relationships from study notes as concept-map triples.
 Each triple is: source node --(linking phrase)--> target node.
 Rules: nodes are short noun phrases (1-5 words). The linking phrase is a short verb phrase of at most 30 words
-(prefer under 8) describing the physiological relationship or flow. Only use facts stated in the text.
+(prefer under 8) describing the relationship or flow. Only use facts stated in the text.
 Reply with ONLY this JSON: {"triples": [{"source": "...", "linking_phrase": "...", "target": "..."}]}"""
 
 
@@ -401,7 +384,6 @@ async def extract_mindmap_triples(
         if t and (key := (t["source"].lower(), t["linking_phrase"].lower(), t["target"].lower())) not in seen:
             seen.add(key)
             if req.markdown_text is not None and req.markdown is None:
-                # Frontend MindMapCanvas schema compatibility
                 target_str = t["target"]
                 is_bridge = "::" in target_str
                 target_sys = None
@@ -424,7 +406,11 @@ async def extract_mindmap_triples(
     for m in EXPLICIT_TRIPLE_RE.finditer(md):
         add(clean_triple(*m.groups()))
 
-    hint = f" The notes belong to the {req.organ_system} system." if req.organ_system else ""
+    active_categories = req.categories or ([req.organ_system] if req.organ_system else [])
+    hint = f" Categories: {', '.join(active_categories)}." if active_categories else ""
+    if req.tags:
+        hint += f" Tags: {', '.join(req.tags)}."
+
     for chunk in chunk_markdown(md):
         try:
             raw = await llm_json_retry(TRIPLE_SYSTEM + hint, chunk)
@@ -441,18 +427,33 @@ async def extract_mindmap_triples(
     return {"triples": out}
 
 
-# ----------------------------------------------------------------------------
-# /auto-tag
-# ----------------------------------------------------------------------------
 class AutoTagRequest(BaseModel):
     text: Optional[str] = None
     markdown_text: Optional[str] = None
+    categories: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
 
 
-TAG_SYSTEM = f"""You tag medical study notes. Reply with ONLY this JSON:
-{{"organ_systems": [...], "clinical_bridge_tags": [...]}}
-organ_systems: choose 1-3 from this list only: {", ".join(ORGAN_SYSTEMS)}.
-clinical_bridge_tags: 2-6 short lowercase tags linking the physiology to clinical reasoning or to OTHER systems."""
+def build_dynamic_tag_system_prompt(
+    allowed_categories: Optional[List[str]] = None,
+    seed_tags: Optional[List[str]] = None,
+) -> str:
+    cat_instruction = (
+        f"choose 1-3 from this allowed list only: {', '.join(allowed_categories)}."
+        if allowed_categories
+        else "choose 1-3 concise high-level domain categories represented in the text."
+    )
+    tag_instruction = (
+        f"choose 2-6 short lowercase tags (incorporating relevant seed tags if applicable: {', '.join(seed_tags)})."
+        if seed_tags
+        else "2-6 short lowercase conceptual bridge tags."
+    )
+    return (
+        "You tag study notes dynamically. Reply with ONLY this JSON:\n"
+        '{"categories": [...], "tags": [...]}\n'
+        f"categories: {cat_instruction}\n"
+        f"tags: {tag_instruction}"
+    )
 
 
 @app.post("/auto-tag")
@@ -465,28 +466,63 @@ async def auto_tag(
     if not body_text.strip():
         raise HTTPException(status_code=422, detail="text or markdown_text is required")
 
-    raw = await llm_json_retry(TAG_SYSTEM, body_text[:MAX_MARKDOWN_CHUNK_CHARS * 2])
-    canon = {s.lower(): s for s in ORGAN_SYSTEMS}
-    systems: List[str] = []
-    for s in raw.get("organ_systems") or ([raw["organ_system"]] if raw.get("organ_system") else []):
-        c = canon.get(str(s).strip().lower())
-        if c and c not in systems:
-            systems.append(c)
-    tags: List[str] = []
-    for t in (raw.get("clinical_bridge_tags") or raw.get("keywords") or []):
-        t = re.sub(r"\s+", " ", str(t)).strip().lower()
-        if t and t not in tags:
-            tags.append(t)
-    return {"organ_systems": systems[:3], "clinical_bridge_tags": tags[:6]}
+    system_prompt = build_dynamic_tag_system_prompt(req.categories, req.tags)
+    raw = await llm_json_retry(system_prompt, body_text[:MAX_MARKDOWN_CHUNK_CHARS * 2])
+
+    raw_cats = (
+        raw.get("categories")
+        or raw.get("organ_systems")
+        or ([raw["organ_system"]] if raw.get("organ_system") else [])
+    )
+    normalized_categories: List[str] = []
+
+    if req.categories:
+        canon = {c.strip().lower(): c.strip() for c in req.categories if str(c).strip()}
+        for s in raw_cats:
+            matched = canon.get(str(s).strip().lower())
+            if matched and matched not in normalized_categories:
+                normalized_categories.append(matched)
+    else:
+        seen_lower = set()
+        for s in raw_cats:
+            cleaned = re.sub(r"\s+", " ", str(s)).strip()
+            if not cleaned:
+                continue
+            low = cleaned.lower()
+            if low not in seen_lower:
+                seen_lower.add(low)
+                formatted = cleaned.title() if cleaned.islower() or cleaned.isupper() else cleaned
+                normalized_categories.append(formatted)
+
+    raw_tags = (
+        raw.get("tags")
+        or raw.get("clinical_bridge_tags")
+        or raw.get("keywords")
+        or (req.tags or [])
+    )
+    normalized_tags: List[str] = []
+    for t in raw_tags:
+        t_clean = re.sub(r"\s+", " ", str(t)).strip().lower()
+        if t_clean and t_clean not in normalized_tags:
+            normalized_tags.append(t_clean)
+
+    cats_out = normalized_categories[:3]
+    tags_out = normalized_tags[:6]
+    return {
+        "categories": cats_out,
+        "tags": tags_out,
+        "organ_systems": cats_out,
+        "clinical_bridge_tags": tags_out,
+    }
 
 
-# ----------------------------------------------------------------------------
-# /generate-specimen-queries & /generate-image-occlusion
-# ----------------------------------------------------------------------------
 class SpecimenQueriesRequest(BaseModel):
-    organ_system: str
+    organ_system: Optional[str] = None
+    category: Optional[str] = None
+    categories: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
     topic_summary: str
-    modalities: List[str] = ["histology_slide", "gross_specimen", "pathway", "model_3d"]
+    modalities: List[str] = ["diagram", "reference_image", "pathway", "model_3d"]
 
 
 @app.post("/generate-specimen-queries")
@@ -495,23 +531,41 @@ async def generate_specimen_queries(
     x_fleet_token: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     verify_token(x_fleet_token)
+    primary_cat = (
+        req.category
+        or (req.categories[0] if req.categories else None)
+        or req.organ_system
+        or "General"
+    )
+    tag_suffix = f" {' '.join(req.tags)}" if req.tags else ""
     queries = [
         {
             "modality": mod,
-            "search_query": f"{req.organ_system} {req.topic_summary} {mod.replace('_', ' ')}",
+            "search_query": f"{primary_cat} {req.topic_summary}{tag_suffix} {mod.replace('_', ' ')}".strip(),
             "expected_structure": req.topic_summary,
         }
         for mod in req.modalities
     ]
-    return {"organ_system": req.organ_system, "queries": queries}
+    return {
+        "category": primary_cat,
+        "organ_system": primary_cat,
+        "categories": req.categories or [primary_cat],
+        "tags": req.tags or [],
+        "queries": queries,
+    }
 
 
 class ImageOcclusionRequest(BaseModel):
     image_filename: str
-    organ_system: str
-    anatomical_structure: str
+    organ_system: Optional[str] = None
+    category: Optional[str] = None
+    categories: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+    anatomical_structure: Optional[str] = None
+    target_concept: Optional[str] = None
     detected_text_hints: Optional[List[str]] = None
     image_base64: Optional[str] = None
+    ocr_lang: str = "eng+ara"
 
 
 @app.post("/generate-image-occlusion")
@@ -520,31 +574,39 @@ async def generate_image_occlusion(
     x_fleet_token: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     verify_token(x_fleet_token)
+    primary_cat = (
+        req.category
+        or (req.categories[0] if req.categories else None)
+        or req.organ_system
+        or "General"
+    )
+    focus_label = req.target_concept or req.anatomical_structure or req.image_filename
+
     ocr_boxes: List[OcclusionBox] = []
     if req.image_base64:
         try:
             image_bytes = base64.b64decode(req.image_base64)
             img_width, img_height = (Image.open(io.BytesIO(image_bytes)).size if Image else (1024, 768))
-            ocr_results = run_ocr_on_image(image_bytes)
+            ocr_results = run_ocr_on_image(image_bytes, lang=req.ocr_lang)
             if ocr_results:
                 ocr_boxes = normalize_boxes_to_pct(ocr_results, img_width, img_height)
         except Exception:
             pass
 
     if not ocr_boxes:
-        hints = req.detected_text_hints or [
-            f"{req.anatomical_structure} - Primary Structure",
-            f"{req.anatomical_structure} - Afferent / Input Branch",
-            f"{req.anatomical_structure} - Efferent / Output Branch",
-            f"{req.anatomical_structure} - Regulatory Receptor / Enzyme",
-        ]
+        dynamic_hints = req.detected_text_hints or (
+            [f"{focus_label} - {tag}" for tag in req.tags] if req.tags else [
+                f"{focus_label} - Region 1",
+                f"{focus_label} - Region 2",
+            ]
+        )
         positions = [
             (14.0, 18.0, 26.0, 9.5),
             (58.0, 22.0, 28.0, 9.5),
             (16.0, 68.0, 27.0, 9.5),
             (56.0, 72.0, 29.0, 9.5),
         ]
-        for idx, label in enumerate(hints[:8]):
+        for idx, label in enumerate(dynamic_hints[:8]):
             px, py, pw, ph = positions[idx % len(positions)]
             row_shift = (idx // len(positions)) * 14.0
             ocr_boxes.append(
@@ -560,8 +622,11 @@ async def generate_image_occlusion(
 
     return {
         "image_filename": req.image_filename,
-        "organ_system": req.organ_system,
-        "anatomical_structure": req.anatomical_structure,
+        "category": primary_cat,
+        "organ_system": primary_cat,
+        "categories": req.categories or [primary_cat],
+        "tags": req.tags or [],
+        "anatomical_structure": focus_label,
         "boxes": [b.model_dump() for b in ocr_boxes],
         "ocr_used": len(ocr_boxes) > 0 and req.image_base64 is not None,
     }

@@ -1,4 +1,5 @@
 """Regenerates studyapp_colab_fleet.ipynb, embedding fleet_server.py so they never drift.
+Preserves 8-bit GGUF inference (`q8_0`) as an archived secondary / heavy-OCR fallback configuration.
 Usage:  python build_notebook.py
 """
 import json
@@ -13,38 +14,42 @@ def md(src):
 
 
 def code(src):
-    return {"cell_type": "code", "metadata": {}, "execution_count": None, "outputs": [],
-            "source": src.strip().splitlines(keepends=True)}
+    return {
+        "cell_type": "code",
+        "metadata": {},
+        "execution_count": None,
+        "outputs": [],
+        "source": src.strip().splitlines(keepends=True),
+    }
 
 
 cells = [
     md("""
-# StudyApp Colab Pro 3B Micro-Fleet
-Runs a 3B instruct model (Qwen-2.5-3B or Llama-3.2-3B) behind FastAPI + a pyngrok tunnel
-(`/grade-written`, `/extract-mindmap-triples`, `/auto-tag`). Run all cells top to bottom and leave the last cell running.
-
-**Before running:** in Colab's left sidebar -> Secrets (key icon) add `NGROK_AUTHTOKEN` (ngrok dashboard) and
-`FLEET_TOKEN` (any long random string; paste the same value into StudyApp). Enable *Notebook access* for both.
+# Convergence Colab Fleet (Archived Secondary / Heavy-OCR & 8-bit GGUF Fallback)
+Preserves 8-bit GGUF (`q8_0`) inference and EasyOCR/Tesseract (`eng+ara`) bounding-box extraction as a secondary fallback to Google AI Studio (`gemma-4-31b-it`).
+All endpoints (`/grade-written`, `/extract-mindmap-triples`, `/auto-tag`, `/generate-image-occlusion`) dynamically accept `categories` and `tags` via the request payload with zero hardcoded domain lists.
 """),
     code("""
-# 1. Configuration
-MODEL = "qwen2.5:3b-instruct"      # or "llama3.2:3b"
+# 1. Configuration (8-bit GGUF Secondary / Heavy-OCR Fallback)
+MODEL = "qwen2.5:3b-instruct-q8_0"
+GGUF_QUANT = "q8_0"
 PORT = 8080
 from google.colab import userdata
 import os
 os.environ["NGROK_AUTHTOKEN"] = userdata.get("NGROK_AUTHTOKEN")
 os.environ["FLEET_TOKEN"] = userdata.get("FLEET_TOKEN")
 os.environ["FLEET_MODEL"] = MODEL
+os.environ["FLEET_GGUF_QUANT"] = GGUF_QUANT
 os.environ["FLEET_BACKEND"] = "ollama"
 """),
     code("""
-# 2. Install dependencies + Ollama (CPU-friendly 3B serving)
-!pip install -q fastapi "uvicorn[standard]" pyngrok httpx
-!apt-get -qq install -y zstd pciutils > /dev/null
+# 2. Install dependencies + Ollama + Heavy OCR (EasyOCR & Tesseract eng+ara)
+!pip install -q fastapi "uvicorn[standard]" pyngrok httpx easyocr pytesseract pillow
+!apt-get -qq install -y zstd pciutils tesseract-ocr tesseract-ocr-eng tesseract-ocr-ara > /dev/null
 !curl -fsSL https://ollama.com/install.sh | sh
 """),
     code("""
-# 3. Start Ollama and pull the model
+# 3. Start Ollama and pull the 8-bit GGUF model (q8_0)
 import subprocess, time, httpx
 subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 for _ in range(60):
@@ -66,22 +71,30 @@ threading.Thread(
     daemon=True).start()
 time.sleep(3)
 tunnel = ngrok.connect(PORT, "http")
-print("Paste into StudyApp -> Colab 3B Ngrok Tunnel URL:\\n", tunnel.public_url)
+print("Secondary Heavy-OCR / GGUF Fallback Tunnel URL:\\n", tunnel.public_url)
 """),
     code("""
-# 5. Smoke test, then keep the runtime alive 24/7
-r = httpx.post(tunnel.public_url + "/grade-written",
+# 5. Dynamic payload verification smoke test
+r = httpx.post(tunnel.public_url + "/auto-tag",
                headers={"X-Fleet-Token": os.environ["FLEET_TOKEN"], "ngrok-skip-browser-warning": "1"},
-               json={"question_prompt": "Why does ADH concentrate urine?",
-                     "mark_scheme": "ADH binds V2 receptors, inserting aquaporin-2 in collecting duct so water is reabsorbed.",
-                     "user_answer": "It makes the collecting duct leaky to water so water goes back to blood"}, timeout=120)
+               json={"text": "Tubuloglomerular feedback and afferent arteriole tone",
+                     "categories": ["Physiology", "Systems Biology"],
+                     "tags": ["autoregulation", "hemodynamics"]}, timeout=120)
 print(r.status_code, r.json())
-while True:   # a tunnel URL change after a runtime restart is handled by StudyApp's offline queue
+while True:
     time.sleep(60)
 """),
 ]
 
-nb = {"cells": cells, "metadata": {"accelerator": "None", "colab": {"provenance": []},
-      "kernelspec": {"display_name": "Python 3", "name": "python3"}}, "nbformat": 4, "nbformat_minor": 5}
+nb = {
+    "cells": cells,
+    "metadata": {
+        "accelerator": "None",
+        "colab": {"provenance": []},
+        "kernelspec": {"display_name": "Python 3", "name": "python3"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
 (here / "studyapp_colab_fleet.ipynb").write_text(json.dumps(nb, indent=1), encoding="utf-8")
 print("wrote studyapp_colab_fleet.ipynb")

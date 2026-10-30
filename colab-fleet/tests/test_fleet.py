@@ -1,4 +1,4 @@
-"""Fleet API tests with the LLM seam mocked (no model needed)."""
+"""Fleet API tests with the LLM seam mocked (dynamic categories & tags, 8-bit GGUF fallback)."""
 import sys
 from pathlib import Path
 
@@ -30,7 +30,20 @@ def mock_llm(monkeypatch, *responses):
     return calls
 
 
-GRADE_BODY = {"question_prompt": "Why does ADH raise urine osmolality?", "mark_scheme": "V2 -> aquaporin-2", "user_answer": "it inserts water channels"}
+GRADE_BODY = {
+    "question_prompt": "Why does ADH raise urine osmolality?",
+    "mark_scheme": "V2 -> aquaporin-2",
+    "user_answer": "it inserts water channels",
+    "categories": ["Renal", "Endocrine"],
+    "tags": ["aquaporin-2", "osmolality"],
+}
+
+
+def test_health_exposes_gguf_quantization_and_secondary_role(client):
+    res = client.get("/health").json()
+    assert res["status"] == "ok"
+    assert res["gguf_quantization"] == "q8_0"
+    assert res["role"] == "archived_secondary_heavy_ocr_fallback"
 
 
 def test_grade_ok_and_clamped(client, monkeypatch):
@@ -72,16 +85,29 @@ def test_triples_explicit_syntax_plus_model_and_word_cap(client, monkeypatch):
         {"source": "Same", "linking_phrase": "x", "target": "same"},
     ]})
     md = "[Male Urethra] --(passes through)--> [Prostate Gland]\n\nGlomerulus text."
-    r = client.post("/extract-mindmap-triples", json={"markdown": md, "organ_system": "Renal"}).json()["triples"]
+    r = client.post(
+        "/extract-mindmap-triples",
+        json={"markdown": md, "categories": ["Renal", "Anatomy"], "tags": ["filtration"]},
+    ).json()["triples"]
     assert r[0] == {"source": "Male Urethra", "linking_phrase": "passes through", "target": "Prostate Gland"}
     assert len(r) == 2 and len(r[1]["linking_phrase"].split()) == 30
 
 
-def test_auto_tag_normalizes(client, monkeypatch):
-    mock_llm(monkeypatch, {"organ_systems": ["renal", "Bogus", "RENAL", "Cardiovascular"],
-                           "clinical_bridge_tags": ["  RAAS ", "raas", "Heart Failure"]})
-    r = client.post("/auto-tag", json={"text": "RAAS and nephron"}).json()
-    assert r == {"organ_systems": ["Renal", "Cardiovascular"], "clinical_bridge_tags": ["raas", "heart failure"]}
+def test_auto_tag_accepts_dynamic_categories_and_tags(client, monkeypatch):
+    mock_llm(monkeypatch, {
+        "categories": ["quantum mechanics", "Bogus", "QUANTUM MECHANICS", "Linear Algebra"],
+        "tags": ["  Hilbert Space ", "hilbert space", "Eigenvalues"],
+    })
+    r = client.post(
+        "/auto-tag",
+        json={
+            "text": "Wavefunction collapse and operators in Hilbert space",
+            "categories": ["Quantum Mechanics", "Linear Algebra", "Thermodynamics"],
+            "tags": ["operators"],
+        },
+    ).json()
+    assert r["categories"] == ["Quantum Mechanics", "Linear Algebra"]
+    assert r["tags"] == ["hilbert space", "eigenvalues"]
 
 
 def test_extract_json_tolerates_fences():

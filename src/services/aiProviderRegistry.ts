@@ -6,10 +6,10 @@ export const AI_PROVIDERS_STORAGE_KEY = "studyapp_ai_providers_v1";
 export const ACTIVE_AI_PROVIDER_STORAGE_KEY = "studyapp_active_ai_provider";
 
 export const DEFAULT_AI_PROVIDERS: AiProviderConfig[] = [
-  { id: "gemini", label: "Gemini", url: "https://gemini.google.com/app", pinned: true, isCustom: false },
-  { id: "chatgpt", label: "ChatGPT", url: "https://chatgpt.com/", pinned: true, isCustom: false },
-  { id: "claude", label: "Claude", url: "https://claude.ai/new", pinned: true, isCustom: false },
-  { id: "notebooklm", label: "NotebookLM", url: "https://notebooklm.google.com/", pinned: true, isCustom: false },
+  { id: "gemini", label: "Gemini", url: "https://gemini.google.com/app", pinned: true, isCustom: false, partition: "persist:ai_gemini" },
+  { id: "chatgpt", label: "ChatGPT", url: "https://chatgpt.com/", pinned: true, isCustom: false, partition: "persist:ai_chatgpt" },
+  { id: "claude", label: "Claude", url: "https://claude.ai/new", pinned: true, isCustom: false, partition: "persist:ai_claude" },
+  { id: "notebooklm", label: "NotebookLM", url: "https://notebooklm.google.com/", pinned: true, isCustom: false, partition: "persist:ai_notebooklm" },
 ];
 
 export const KNOWN_AI_CATALOG: Array<{
@@ -180,6 +180,7 @@ export function loadSavedAiProviders(storage: Pick<Storage, "getItem" | "setItem
                 url: item.url,
                 pinned: item.pinned !== false,
                 isCustom: true,
+                partition: item.partition || `persist:ai_${item.id}`,
               });
             }
           }
@@ -230,7 +231,7 @@ export async function saveAiProviders(
 }
 
 export async function addOrPinAiProvider(
-  candidate: { id?: string; label: string; url: string },
+  candidate: { id?: string; label: string; url: string; partition?: string },
   existingList?: AiProviderConfig[],
   storage: Pick<Storage, "getItem" | "setItem"> = localStorage
 ): Promise<{ providers: AiProviderConfig[]; added: AiProviderConfig }> {
@@ -247,6 +248,7 @@ export async function addOrPinAiProvider(
     url: cleanUrl,
     pinned: true,
     isCustom: !DEFAULT_AI_PROVIDERS.some((d) => d.id === id),
+    partition: candidate.partition || `persist:ai_${id}`,
   };
 
   const idx = current.findIndex((p) => p.id === id);
@@ -290,4 +292,8 @@ export function partitionPinnedProviders(providers: AiProviderConfig[]): {
     inlineProviders: pinned.slice(0, MAX_INLINE_PINNED_AI_TABS),
     overflowProviders: pinned.slice(MAX_INLINE_PINNED_AI_TABS),
   };
+}
+
+export function getProviderPartition(idOrName: string): string {
+  return `persist:ai_${sanitizeProviderId(idOrName)}`;
 }

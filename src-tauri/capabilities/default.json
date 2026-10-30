@@ -72,6 +72,8 @@
           "path": "$APPLOCALDATA/**"
         }
       ]
-    }
+    },
+    "allow-resolve-shorthand-query",
+    "allow-spawn-custom-ai-panel"
   ]
 }

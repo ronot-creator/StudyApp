@@ -18,6 +18,9 @@ pub const WEBVIEW2_RAM_DIET_ARGS: &str =
 
 /// Lightweight MutationObserver injected into AI WebViews to auto-click "Allow" on Composio MCP tool prompts
 /// and disable heavy background CSS animations to conserve GPU/RAM.
+/// Embedded Preload Command Bridge (`src-tauri/src/preload.js`) injected into all AI WebViews
+pub const PRELOAD_BRIDGE_SCRIPT: &str = include_str!("preload.js");
+
 pub const AUTO_ALLOW_AND_PERF_SCRIPT: &str = r#"
 (function() {
   if (window.__CONVERGENCE_MCP_OBSERVER_INSTALLED__) return;
@@ -135,6 +138,30 @@ pub fn resolve_app_local_data_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
 }
 
 /// Resolves the persistent WebView profile directory inside `$APPLOCALDATA/.webview_partitions/persist_study_session`.
+pub fn sanitize_ai_slug(raw: &str) -> String {
+    let slug: String = raw
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if slug.is_empty() { "custom".to_string() } else { slug }
+}
+
+pub fn resolve_ai_provider_partition_dir(
+    app: Option<&tauri::AppHandle>,
+    provider_slug: &str,
+) -> (String, PathBuf) {
+    let clean_slug = sanitize_ai_slug(provider_slug);
+    let partition_id = format!("persist:ai_{clean_slug}");
+    let dir = resolve_app_local_data_dir(app)
+        .join(".webview_partitions")
+        .join(format!("persist_ai_{clean_slug}"));
+    (partition_id, dir)
+}
+
 pub fn resolve_study_session_partition_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
     resolve_app_local_data_dir(app)
         .join(".webview_partitions")
@@ -402,6 +429,112 @@ fn spawn_mcp_sidecar(app_data_dir: &Path) -> Option<Child> {
 }
 
 #[tauri::command]
+fn resolve_shorthand_query(
+    app: tauri::AppHandle,
+    query: String,
+) -> Result<serde_json::Value, String> {
+    let app_data_dir = resolve_app_local_data_dir(Some(&app));
+    let _ = ensure_appdata_subdirs(&app_data_dir);
+    let vault_dir = app_data_dir.join("vault");
+    let cleaned_topic = query
+        .trim()
+        .trim_start_matches("/q ")
+        .trim_start_matches("/vault ")
+        .trim_start_matches("/context ")
+        .trim();
+    let mut matched_files: Vec<String> = Vec::new();
+    let mut excerpts: Vec<String> = Vec::new();
+    let lower_topic = cleaned_topic.to_lowercase();
+
+    if let Ok(entries) = std::fs::read_dir(&vault_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("note.md").to_string();
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if lower_topic.is_empty()
+                        || fname.to_lowercase().contains(&lower_topic)
+                        || content.to_lowercase().contains(&lower_topic)
+                    {
+                        matched_files.push(fname.clone());
+                        let snippet: String = content.chars().take(900).collect();
+                        excerpts.push(format!("--- {} ---\n{}", fname, snippet.trim()));
+                    }
+                }
+            }
+        }
+    }
+
+    let context_excerpt = if excerpts.is_empty() {
+        format!("No exact file match in $APPLOCALDATA/vault for '{}'. Synthesize high-yield causal mechanisms.", cleaned_topic)
+    } else {
+        excerpts.join("\n\n")
+    };
+
+    let formatted_prompt = format!(
+        "[CONVERGENCE LOCAL VAULT CONTEXT — query: \"{}\"]\n{}\n[/CONVERGENCE LOCAL VAULT CONTEXT]\nInstruction: Using the local vault context above, provide a token-optimized, mechanistically rigorous explanation for: {}",
+        cleaned_topic, context_excerpt, cleaned_topic
+    );
+
+    Ok(serde_json::json!({
+        "query": cleaned_topic,
+        "matched_files": matched_files,
+        "context_excerpt": context_excerpt,
+        "formatted_prompt": formatted_prompt,
+    }))
+}
+
+#[tauri::command]
+fn spawn_custom_ai_panel(
+    app: tauri::AppHandle,
+    state: State<'_, AppRuntimeState>,
+    name: String,
+    url: String,
+) -> Result<AiPanelStatus, String> {
+    let clean_slug = sanitize_ai_slug(&name);
+    let (_panel_label, float_label, resolved_url, _default_title) =
+        resolve_ai_provider_with_url(&clean_slug, Some(&url))?;
+    let (partition_id, partition_dir) = resolve_ai_provider_partition_dir(Some(&app), &clean_slug);
+
+    std::fs::create_dir_all(&partition_dir)
+        .map_err(|e| format!("Failed to create isolated AI partition '{partition_id}': {e}"))?;
+
+    if let Some(existing_win) = app.get_webview_window(&float_label) {
+        let _ = existing_win.set_focus();
+    } else {
+        let parsed_url: url::Url = resolved_url
+            .parse()
+            .map_err(|e| format!("Invalid custom AI URL '{resolved_url}': {e}"))?;
+
+        let window_title = format!("{} ({})", name.trim(), partition_id);
+        WebviewWindowBuilder::new(&app, &float_label, WebviewUrl::External(parsed_url))
+            .title(&window_title)
+            .inner_size(1020.0, 860.0)
+            .resizable(true)
+            .data_directory(partition_dir.clone())
+            .initialization_script(PRELOAD_BRIDGE_SCRIPT)
+            .build()
+            .map_err(|e| format!("Failed to spawn custom AI WebView '{float_label}': {e}"))?;
+    }
+
+    {
+        let mut detached_guard = state
+            .detached_providers
+            .lock()
+            .map_err(|e| format!("Mutex lock error: {e}"))?;
+        detached_guard.insert(clean_slug.clone(), float_label.clone());
+    }
+
+    Ok(AiPanelStatus {
+        provider: clean_slug,
+        mode: "detached".to_string(),
+        label: float_label,
+        target_url: resolved_url,
+        partition_dir: partition_dir.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
 fn get_mcp_sidecar_status(
     app: tauri::AppHandle,
     state: State<'_, AppRuntimeState>,
@@ -529,7 +662,7 @@ fn switch_active_ai_panel(
 
         let webview_builder = WebviewBuilder::new(&panel_label, WebviewUrl::External(parsed_url))
             .data_directory(partition_dir.clone())
-            .initialization_script(AUTO_ALLOW_AND_PERF_SCRIPT)
+            .initialization_script(PRELOAD_BRIDGE_SCRIPT)
             .auto_resize();
 
         main_window
@@ -628,7 +761,7 @@ fn detach_ai_panel(
             .inner_size(980.0, 860.0)
             .resizable(true)
             .data_directory(partition_dir.clone())
-            .initialization_script(AUTO_ALLOW_AND_PERF_SCRIPT)
+            .initialization_script(PRELOAD_BRIDGE_SCRIPT)
             .build()
             .map_err(|e| format!("Failed to spawn floating AI window '{float_label}': {e}"))?;
     }
@@ -795,6 +928,8 @@ pub fn run() {
             navigate_ai_panel,
             update_active_highlight,
             get_mcp_sidecar_status,
+            resolve_shorthand_query,
+            spawn_custom_ai_panel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Convergence tauri application");
