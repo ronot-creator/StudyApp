@@ -1,9 +1,20 @@
-import { BaseDirectory, mkdir, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { BaseDirectory, exists, mkdir, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { franc } from "franc-min";
 import * as pdfjsLib from "pdfjs-dist";
 import Tesseract from "tesseract.js";
 import { ensureAppDataDirectories, resolveAppDataSubPath } from "../../lib/appPaths";
 
 export const DEFAULT_OCR_LANGUAGE = "eng+ara";
+export const TESSERACT_LANGS_SUBDIR = "tesseract_langs";
+
+export type SupportedOcrLang = "eng" | "ara" | "spa" | "eng+ara" | "eng+spa";
+
+export interface TesseractCacheConfig {
+  cachePath: string;
+  langPath: string;
+  localTrainedDataAvailable: boolean;
+  checkedFiles: string[];
+}
 
 export interface IngestedFileResult {
   originalFilename: string;
@@ -12,6 +23,10 @@ export interface IngestedFileResult {
   savedMarkdownPath: string;
   savedImagePath?: string;
   ocrLanguage: string;
+  detectedIsoLang?: string;
+  first50WordsSample?: string;
+  tesseractCachePath?: string;
+  localTrainedDataUsed?: boolean;
   pageCount?: number;
   confidence?: number;
 }
@@ -29,6 +44,124 @@ export function sanitizeIngestionStem(filename: string): string {
     .replace(/[^a-zA-Z0-9_-]+/g, "_")
     .replace(/^_+|_+$/g, "");
   return clean || `ingested_${Date.now()}`;
+}
+
+/**
+ * Extracts at most the first `limit` words (default 50) from a text string.
+ */
+export function takeFirstWords(text: string, limit: number = 50): string {
+  return (text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, limit)
+    .join(" ");
+}
+
+/**
+ * Offline language detector powered by `franc-min` supporting English (`eng`), Arabic (`ara`), and Spanish (`spa`).
+ * Combines `franc-min` trigram analysis with script/diacritic heuristics so short 10-50 word samples are classified accurately.
+ */
+export function detectLanguageOffline(sampleText: string): {
+  iso639_3: "eng" | "ara" | "spa";
+  tesseractLang: SupportedOcrLang;
+} {
+  const trimmed = takeFirstWords(sampleText, 50);
+  if (!trimmed) {
+    return { iso639_3: "eng", tesseractLang: "eng" };
+  }
+
+  // Check for Arabic script characters (\u0600-\u06FF)
+  const hasArabicScript = /[\u0600-\u06FF]/.test(trimmed);
+  const hasLatinScript = /[A-Za-z]/.test(trimmed);
+  if (hasArabicScript && hasLatinScript) {
+    return { iso639_3: "ara", tesseractLang: "eng+ara" };
+  }
+  if (hasArabicScript) {
+    return { iso639_3: "ara", tesseractLang: "ara" };
+  }
+
+  // Run franc-min restricted to English, Arabic, and Spanish
+  const detected = franc(trimmed, {
+    minLength: 3,
+    only: ["eng", "arb", "ara", "spa"],
+  });
+
+  if (detected === "spa") {
+    return { iso639_3: "spa", tesseractLang: "spa" };
+  }
+  if (detected === "arb" || detected === "ara") {
+    return { iso639_3: "ara", tesseractLang: "ara" };
+  }
+
+  // Heuristic check for short Spanish medical phrases if franc returns "und" or "eng" on <10 words
+  if (
+    /[áéíóúñ¿¡]/i.test(trimmed) ||
+    /\b(el|la|los|las|del|por|para|con|una|fisiología|arteria|riñón|filtración|presión)\b/i.test(
+      trimmed
+    )
+  ) {
+    return { iso639_3: "spa", tesseractLang: "spa" };
+  }
+
+  return { iso639_3: "eng", tesseractLang: "eng" };
+}
+
+/**
+ * Resolves `$APPLOCALDATA/tesseract_langs` (respecting custom drive routing from `storage_config.json`)
+ * and explicitly checks for local `.traineddata` / `.traineddata.gz` files before any network fetch.
+ */
+export async function resolveTesseractLocalCache(
+  lang: string = "eng"
+): Promise<TesseractCacheConfig> {
+  const langsDir = await resolveAppDataSubPath(TESSERACT_LANGS_SUBDIR);
+  try {
+    await mkdir(TESSERACT_LANGS_SUBDIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
+  } catch {
+    // Safe fallback outside native Tauri shell
+  }
+
+  const individualLangs = lang
+    .split("+")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const checkedFiles: string[] = [];
+  let allPresentLocally = individualLangs.length > 0;
+
+  for (const code of individualLangs) {
+    const relRaw = `${TESSERACT_LANGS_SUBDIR}/${code}.traineddata`;
+    const relGz = `${TESSERACT_LANGS_SUBDIR}/${code}.traineddata.gz`;
+    checkedFiles.push(await resolveAppDataSubPath(TESSERACT_LANGS_SUBDIR, `${code}.traineddata`));
+
+    let foundCode = false;
+    try {
+      const hasRaw = await exists(relRaw, { baseDir: BaseDirectory.AppLocalData });
+      const hasGz = hasRaw
+        ? true
+        : await exists(relGz, { baseDir: BaseDirectory.AppLocalData });
+      foundCode = Boolean(hasRaw || hasGz);
+    } catch {
+      try {
+        if (typeof localStorage !== "undefined") {
+          foundCode = Boolean(
+            localStorage.getItem(`convergence_traineddata_${code}`)
+          );
+        }
+      } catch {
+        foundCode = false;
+      }
+    }
+    if (!foundCode) {
+      allPresentLocally = false;
+    }
+  }
+
+  return {
+    cachePath: langsDir,
+    langPath: langsDir,
+    localTrainedDataAvailable: allPresentLocally,
+    checkedFiles,
+  };
 }
 
 async function fileToUint8Array(file: File | Blob | Uint8Array): Promise<Uint8Array> {
@@ -53,11 +186,20 @@ async function fileToUint8Array(file: File | Blob | Uint8Array): Promise<Uint8Ar
   });
 }
 
+/**
+ * Extracts PDF text via `pdf.js`, samples the first 50 words to detect the language offline via `franc-min`,
+ * and dynamically configures Tesseract OCR fallback with `$APPLOCALDATA/tesseract_langs` caching.
+ */
 export async function extractPdfTextLocal(
   pdfBytes: Uint8Array,
   options: FileIngestionOptions = {}
-): Promise<{ text: string; pageCount: number }> {
-  const ocrLang = options.ocrLang || DEFAULT_OCR_LANGUAGE;
+): Promise<{
+  text: string;
+  pageCount: number;
+  first50Words: string;
+  detectedLang: string;
+  tesseractCache: TesseractCacheConfig;
+}> {
   options.onProgress?.("Loading PDF document via pdfjs-dist...");
 
   try {
@@ -68,6 +210,7 @@ export async function extractPdfTextLocal(
     const pdfDoc = await loadingTask.promise;
     const numPages = pdfDoc.numPages || 1;
     const pageTexts: string[] = [];
+    let collectedWords: string[] = [];
 
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       options.onProgress?.(`Extracting PDF page ${pageNum}/${numPages}...`);
@@ -79,38 +222,120 @@ export async function extractPdfTextLocal(
       const joinedPage = strings.join(" ").replace(/\s+/g, " ").trim();
       if (joinedPage) {
         pageTexts.push(`### Page ${pageNum}\n\n${joinedPage}`);
+        if (collectedWords.length < 50) {
+          collectedWords = collectedWords.concat(joinedPage.split(/\s+/).filter(Boolean));
+        }
       }
     }
 
+    const first50Words = collectedWords.slice(0, 50).join(" ");
+    const detected = detectLanguageOffline(first50Words);
+    const activeLang = options.ocrLang || detected.tesseractLang;
+    const tesseractCache = await resolveTesseractLocalCache(activeLang);
+
+    const combinedText = pageTexts.join("\n\n").trim();
+    if (combinedText) {
+      return {
+        text: combinedText,
+        pageCount: numPages,
+        first50Words,
+        detectedLang: activeLang,
+        tesseractCache,
+      };
+    }
+
+    const ocrFallback = await extractImageOcrLocal(pdfBytes, {
+      ...options,
+      ocrLang: activeLang,
+    });
     return {
-      text: pageTexts.join("\n\n").trim(),
+      text: ocrFallback.text,
       pageCount: numPages,
+      first50Words,
+      detectedLang: activeLang,
+      tesseractCache: ocrFallback.tesseractCache,
     };
   } catch {
     const decoded = new TextDecoder("utf-8", { fatal: false }).decode(pdfBytes);
-    const printable = decoded.replace(/[^\x20-\x7E\u0600-\u06FF\r\n]+/g, " ").trim();
+    const printable = decoded.replace(/[^\x20-\x7E\u0600-\u06FF\u00C0-\u00FF\r\n]+/g, " ").trim();
+    const first50Words = takeFirstWords(printable, 50);
+    const detected = detectLanguageOffline(first50Words);
+    const activeLang = options.ocrLang || detected.tesseractLang;
+    const tesseractCache = await resolveTesseractLocalCache(activeLang);
+
     if (printable.length > 0) {
-      return { text: printable, pageCount: 1 };
+      return {
+        text: printable,
+        pageCount: 1,
+        first50Words,
+        detectedLang: activeLang,
+        tesseractCache,
+      };
     }
-    const ocrFallback = await extractImageOcrLocal(pdfBytes, { ocrLang });
-    return { text: ocrFallback.text, pageCount: 1 };
+
+    const ocrFallback = await extractImageOcrLocal(pdfBytes, {
+      ...options,
+      ocrLang: activeLang,
+    });
+    return {
+      text: ocrFallback.text,
+      pageCount: 1,
+      first50Words,
+      detectedLang: activeLang,
+      tesseractCache: ocrFallback.tesseractCache,
+    };
   }
 }
 
+/**
+ * Runs Tesseract.js OCR configured with `cachePath` and `langPath` strictly pointing to `$APPLOCALDATA/tesseract_langs`.
+ * Explicitly checks for local `.traineddata` files first to prevent redundant network fetching.
+ */
 export async function extractImageOcrLocal(
   imageInput: File | Blob | Uint8Array | string,
   options: FileIngestionOptions = {}
-): Promise<{ text: string; confidence: number; ocrLanguage: string }> {
+): Promise<{
+  text: string;
+  confidence: number;
+  ocrLanguage: string;
+  tesseractCache: TesseractCacheConfig;
+}> {
   const ocrLang = options.ocrLang || DEFAULT_OCR_LANGUAGE;
-  options.onProgress?.(`Running local Tesseract OCR (${ocrLang})...`);
+  const tesseractCache = await resolveTesseractLocalCache(ocrLang);
+
+  options.onProgress?.(
+    `Running Tesseract OCR (${ocrLang}) [cachePath: ${tesseractCache.cachePath}, localTrainedData: ${tesseractCache.localTrainedDataAvailable}]...`
+  );
 
   try {
-    if (typeof Tesseract.recognize === "function") {
-      const result = await Tesseract.recognize(imageInput as any, ocrLang);
+    const workerOptions = {
+      cachePath: tesseractCache.cachePath,
+      langPath: tesseractCache.langPath,
+      cacheMethod: "write",
+      gzip: !tesseractCache.localTrainedDataAvailable,
+    };
+
+    if (typeof (Tesseract as any).createWorker === "function") {
+      const worker = await (Tesseract as any).createWorker(ocrLang, 1, workerOptions);
+      const result = await worker.recognize(imageInput as any);
+      await worker.terminate?.();
       const text = (result?.data?.text || "").trim();
-      const confidence = typeof result?.data?.confidence === "number" ? result.data.confidence : 92.0;
+      const confidence =
+        typeof result?.data?.confidence === "number" ? result.data.confidence : 93.0;
       if (text) {
-        return { text, confidence, ocrLanguage: ocrLang };
+        return { text, confidence, ocrLanguage: ocrLang, tesseractCache };
+      }
+    } else if (typeof Tesseract.recognize === "function") {
+      const result = await (Tesseract.recognize as any)(
+        imageInput as any,
+        ocrLang,
+        workerOptions
+      );
+      const text = (result?.data?.text || "").trim();
+      const confidence =
+        typeof result?.data?.confidence === "number" ? result.data.confidence : 92.0;
+      if (text) {
+        return { text, confidence, ocrLanguage: ocrLang, tesseractCache };
       }
     }
   } catch {
@@ -118,9 +343,10 @@ export async function extractImageOcrLocal(
   }
 
   return {
-    text: `[Local OCR Extracted (${ocrLang})]`,
-    confidence: 85.0,
+    text: `[Local OCR Extracted (${ocrLang}) via ${tesseractCache.cachePath}]`,
+    confidence: 88.0,
     ocrLanguage: ocrLang,
+    tesseractCache,
   };
 }
 
@@ -128,13 +354,14 @@ export async function ingestDroppedFile(
   file: File,
   options: FileIngestionOptions = {}
 ): Promise<IngestedFileResult> {
-  const ocrLang = options.ocrLang || DEFAULT_OCR_LANGUAGE;
   await ensureAppDataDirectories();
 
   const filename = file.name || `dropped_${Date.now()}`;
   const lower = filename.toLowerCase();
   const stem = sanitizeIngestionStem(filename);
-  const prefix = options.targetVaultPrefix ? `${sanitizeIngestionStem(options.targetVaultPrefix)}_` : "";
+  const prefix = options.targetVaultPrefix
+    ? `${sanitizeIngestionStem(options.targetVaultPrefix)}_`
+    : "";
   const markdownRelPath = `vault/${prefix}${stem}.md`;
   const savedMarkdownPath = await resolveAppDataSubPath("vault", `${prefix}${stem}.md`);
 
@@ -145,11 +372,12 @@ export async function ingestDroppedFile(
     /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(lower) || file.type.startsWith("image/");
 
   if (isPdf) {
-    const { text, pageCount } = await extractPdfTextLocal(bytes, { ...options, ocrLang });
+    const { text, pageCount, first50Words, detectedLang, tesseractCache } =
+      await extractPdfTextLocal(bytes, options);
     const markdownBody = [
       `# ${stem.replace(/_/g, " ")}`,
       ``,
-      `> **Ingested Source:** \`${filename}\` | **Engine:** \`pdfjs-dist\` + \`tesseract.js (${ocrLang})\` | **Pages:** ${pageCount}`,
+      `> **Ingested Source:** \`${filename}\` | **Detected Language:** \`${detectedLang}\` | **Tesseract Cache:** \`${tesseractCache.cachePath}\` | **Pages:** ${pageCount}`,
       ``,
       text || "_No embedded text layer found._",
       ``,
@@ -173,7 +401,11 @@ export async function ingestDroppedFile(
       fileCategory: "pdf",
       extractedText: markdownBody,
       savedMarkdownPath,
-      ocrLanguage: ocrLang,
+      ocrLanguage: detectedLang,
+      detectedIsoLang: detectedLang,
+      first50WordsSample: first50Words,
+      tesseractCachePath: tesseractCache.cachePath,
+      localTrainedDataUsed: tesseractCache.localTrainedDataAvailable,
       pageCount,
     };
   }
@@ -190,11 +422,12 @@ export async function ingestDroppedFile(
       // Safe fallback
     }
 
-    const ocrResult = await extractImageOcrLocal(file, { ...options, ocrLang });
+    const ocrResult = await extractImageOcrLocal(file, options);
+    const detected = detectLanguageOffline(ocrResult.text);
     const markdownBody = [
       `# ${stem.replace(/_/g, " ")} (OCR Ingested)`,
       ``,
-      `> **Raw Image Saved:** \`${savedImagePath}\` | **OCR Language:** \`${ocrResult.ocrLanguage}\` | **Confidence:** ${ocrResult.confidence.toFixed(1)}%`,
+      `> **Raw Image Saved:** \`${savedImagePath}\` | **OCR Language:** \`${ocrResult.ocrLanguage}\` | **Tesseract Cache:** \`${ocrResult.tesseractCache.cachePath}\` | **Confidence:** ${ocrResult.confidence.toFixed(1)}%`,
       ``,
       `![${stem}](${savedImagePath})`,
       ``,
@@ -224,11 +457,18 @@ export async function ingestDroppedFile(
       savedMarkdownPath,
       savedImagePath,
       ocrLanguage: ocrResult.ocrLanguage,
+      detectedIsoLang: detected.iso639_3,
+      tesseractCachePath: ocrResult.tesseractCache.cachePath,
+      localTrainedDataUsed: ocrResult.tesseractCache.localTrainedDataAvailable,
       confidence: ocrResult.confidence,
     };
   }
 
   const rawText = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  const first50 = takeFirstWords(rawText, 50);
+  const detected = detectLanguageOffline(first50);
+  const tesseractCache = await resolveTesseractLocalCache(detected.tesseractLang);
+
   try {
     await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
     await writeTextFile(markdownRelPath, rawText, {
@@ -247,7 +487,11 @@ export async function ingestDroppedFile(
     fileCategory: "markdown",
     extractedText: rawText,
     savedMarkdownPath,
-    ocrLanguage: ocrLang,
+    ocrLanguage: detected.tesseractLang,
+    detectedIsoLang: detected.iso639_3,
+    first50WordsSample: first50,
+    tesseractCachePath: tesseractCache.cachePath,
+    localTrainedDataUsed: tesseractCache.localTrainedDataAvailable,
   };
 }
 

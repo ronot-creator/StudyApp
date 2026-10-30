@@ -2,6 +2,59 @@ import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Database from "@tauri-apps/plugin-sql";
 import ReactMarkdown from "react-markdown";
+import { Rnd } from "react-rnd";
+
+export interface MarkdownFootnoteEntry {
+  id: string;
+  text: string;
+}
+
+/**
+ * Extracts all Markdown footnote references (`[^1]`) and definitions (`[^1]: text`) from a `.md` document.
+ */
+export function parseMarkdownFootnotes(markdownContent: string): MarkdownFootnoteEntry[] {
+  const definitions = new Map<string, string>();
+  const defRegex = /^\[\^([^\]]+)\]:\s*(.*)$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = defRegex.exec(markdownContent)) !== null) {
+    definitions.set(match[1].trim(), match[2].trim());
+  }
+
+  const refRegex = /\[\^([^\]]+)\](?!:)/g;
+  const seenIds = new Set<string>(definitions.keys());
+  while ((match = refRegex.exec(markdownContent)) !== null) {
+    seenIds.add(match[1].trim());
+  }
+
+  return Array.from(seenIds).map((id) => ({
+    id,
+    text: definitions.get(id) || "",
+  }));
+}
+
+/**
+ * Inserts a `[^id]` footnote reference if missing and appends or updates `[^id]: noteText` at the bottom of the `.md` file.
+ */
+export function upsertMarkdownFootnote(
+  markdownContent: string,
+  footnoteId: string,
+  noteText: string
+): string {
+  const cleanId = footnoteId.replace(/^\[\^|\]$/g, "").trim() || "1";
+  const cleanNote = noteText.replace(/\r?\n+/g, " ").trim();
+  const defPattern = new RegExp(`^\\[\\^${cleanId}\\]:\\s*.*$`, "m");
+
+  let nextMd = markdownContent;
+  if (!new RegExp(`\\[\\^${cleanId}\\](?!:)`).test(nextMd)) {
+    nextMd = `${nextMd.trim()} [^${cleanId}]`;
+  }
+
+  if (defPattern.test(nextMd)) {
+    return `${nextMd.replace(defPattern, `[^${cleanId}]: ${cleanNote}`).trim()}\n`;
+  }
+  return `${nextMd.trim()}\n\n[^${cleanId}]: ${cleanNote}\n`;
+}
+
 import { Editor, rootCtx, defaultValueCtx } from "@milkdown/core";
 import { Milkdown, MilkdownProvider, useEditor } from "@milkdown/react";
 import { commonmark } from "@milkdown/preset-commonmark";
@@ -192,6 +245,14 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
   const [ingestingStatus, setIngestingStatus] = useState<string | null>(null);
   const [recentIngestions, setRecentIngestions] = useState<IngestedFileResult[]>([]);
+  const [activeFootnoteOverlay, setActiveFootnoteOverlay] = useState<{
+    id: string;
+    text: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
 
   const activeFilename = `vault/${getSafeVaultFilename(activeSystem)}.md`;
 
@@ -343,6 +404,32 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
   };
 
   const extractedAnchors = parseThoughtAnchors(content);
+  const extractedFootnotes = parseMarkdownFootnotes(content);
+
+  const handleOpenFootnoteOverlay = (footnoteId: string) => {
+    const cleanId = footnoteId.replace(/^\[\^|\]$/g, "").trim() || "1";
+    const existing = extractedFootnotes.find((f) => f.id === cleanId);
+    setActiveFootnoteOverlay({
+      id: cleanId,
+      text: existing?.text || "",
+      x: 240,
+      y: 160,
+      width: 420,
+      height: 240,
+    });
+  };
+
+  const handleSaveFootnoteOverlay = async () => {
+    if (!activeFootnoteOverlay) return;
+    const updatedMd = upsertMarkdownFootnote(
+      content,
+      activeFootnoteOverlay.id,
+      activeFootnoteOverlay.text
+    );
+    await handleContentUpdate(updatedMd);
+    setEditorEpoch((n) => n + 1);
+    setActionToast(`Saved footnote [^${activeFootnoteOverlay.id}] to bottom of ${activeFilename}`);
+  };
 
   return (
     <div
@@ -536,6 +623,104 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
           </div>
         )}
       </div>
+
+      <div className="liquid-card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px", flexWrap: "wrap", gap: "8px" }}>
+          <h4 style={{ margin: 0, fontSize: "13px", color: "#38bdf8" }}>
+            Interactive Markdown Footnotes (<code>[^1]</code> — Click to Spawn Draggable <code>react-rnd</code> Overlay)
+          </h4>
+          <button
+            className="liquid-btn"
+            data-testid="spawn-new-footnote-btn"
+            style={{ padding: "4px 10px", fontSize: "11.5px" }}
+            onClick={() => handleOpenFootnoteOverlay(String(extractedFootnotes.length + 1))}
+          >
+            + Add Footnote [^${extractedFootnotes.length + 1}]
+          </button>
+        </div>
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          {(extractedFootnotes.length > 0
+            ? extractedFootnotes
+            : [{ id: "1", text: "Click to annotate [^1] in draggable react-rnd overlay" }]
+          ).map((fn) => (
+            <button
+              key={fn.id}
+              className="liquid-btn liquid-btn-secondary"
+              data-testid={`footnote-chip-${fn.id}`}
+              style={{ padding: "5px 11px", fontSize: "12px" }}
+              onClick={() => handleOpenFootnoteOverlay(fn.id)}
+            >
+              [^{fn.id}] {fn.text ? fn.text.slice(0, 42) : "(Edit Note)"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {activeFootnoteOverlay && (
+        <Rnd
+          default={{
+            x: activeFootnoteOverlay.x,
+            y: activeFootnoteOverlay.y,
+            width: activeFootnoteOverlay.width,
+            height: activeFootnoteOverlay.height,
+          }}
+          minWidth={320}
+          minHeight={190}
+          bounds="window"
+          style={{ zIndex: 180 }}
+        >
+          <div
+            className="liquid-card"
+            data-testid="footnote-rnd-overlay"
+            style={{
+              width: "100%",
+              height: "100%",
+              display: "flex",
+              flexDirection: "column",
+              gap: "8px",
+              padding: "12px 14px",
+              border: "1px solid rgba(56, 189, 248, 0.65)",
+              boxShadow: "0 20px 50px rgba(2, 6, 23, 0.9)",
+              background: "rgba(9, 15, 29, 0.94)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "move" }}>
+              <span style={{ fontSize: "12.5px", fontWeight: 700, color: "#38bdf8" }}>
+                📌 Draggable Footnote Editor (<code>[^{activeFootnoteOverlay.id}]</code>)
+              </span>
+              <button
+                className="liquid-btn liquid-btn-secondary"
+                style={{ padding: "2px 8px", fontSize: "11px" }}
+                onClick={() => setActiveFootnoteOverlay(null)}
+              >
+                X
+              </button>
+            </div>
+            <input
+              type="text"
+              className="liquid-input"
+              data-testid="footnote-rnd-input"
+              style={{ flex: 1, fontSize: "12.5px" }}
+              placeholder={`Write note for [^${activeFootnoteOverlay.id}] (appends to bottom of ${activeFilename})...`}
+              value={activeFootnoteOverlay.text}
+              onChange={(e) =>
+                setActiveFootnoteOverlay((prev) =>
+                  prev ? { ...prev, text: e.target.value } : null
+                )
+              }
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+              <button
+                className="liquid-btn"
+                data-testid="footnote-rnd-save-btn"
+                onClick={() => void handleSaveFootnoteOverlay()}
+              >
+                Save to Bottom of .md
+              </button>
+            </div>
+          </div>
+        </Rnd>
+      )}
 
       {contextMenuPos && (
         <div

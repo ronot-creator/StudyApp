@@ -74,6 +74,9 @@
       ]
     },
     "allow-resolve-shorthand-query",
-    "allow-spawn-custom-ai-panel"
+    "allow-spawn-custom-ai-panel",
+    "allow-get-storage-config",
+    "allow-set-custom-storage-dir",
+    "allow-append-webview-footnote"
   ]
 }

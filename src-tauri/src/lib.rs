@@ -175,6 +175,7 @@ pub fn ensure_appdata_subdirs(base_dir: &Path) -> Result<(), String> {
         "vault",
         "images",
         "srs_data",
+        "tesseract_langs",
         ".webview_partitions/persist_study_session",
     ] {
         let dir = base_dir.join(sub);
@@ -532,6 +533,74 @@ fn spawn_custom_ai_panel(
         target_url: resolved_url,
         partition_dir: partition_dir.to_string_lossy().to_string(),
     })
+}
+
+#[tauri::command]
+fn get_storage_config(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let standard = resolve_standard_os_appdata_dir(Some(&app));
+    let active = resolve_app_local_data_dir(Some(&app));
+    let cfg_path = standard.join(STORAGE_CONFIG_FILENAME);
+    let has_custom = read_custom_drive_from_bootstrap(&standard).is_some();
+    Ok(serde_json::json!({
+        "config_file": cfg_path.to_string_lossy(),
+        "standard_appdata_dir": standard.to_string_lossy(),
+        "custom_target_dir": active.to_string_lossy(),
+        "first_run_completed": has_custom,
+    }))
+}
+
+#[tauri::command]
+fn set_custom_storage_dir(
+    app: tauri::AppHandle,
+    state: State<'_, AppRuntimeState>,
+    target_dir: String,
+) -> Result<serde_json::Value, String> {
+    let standard = resolve_standard_os_appdata_dir(Some(&app));
+    std::fs::create_dir_all(&standard).map_err(|e| e.to_string())?;
+    let cfg_path = standard.join(STORAGE_CONFIG_FILENAME);
+    let payload = serde_json::json!({
+        "version": "1.0",
+        "customTargetDir": target_dir.trim(),
+        "firstRunCompleted": true,
+    });
+    let serialized = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    if serialized.len() > MAX_STORAGE_CONFIG_BYTES {
+        return Err("Storage config exceeds 1KB limit".to_string());
+    }
+    std::fs::write(&cfg_path, serialized.as_bytes()).map_err(|e| e.to_string())?;
+
+    let resolved = resolve_app_local_data_dir(Some(&app));
+    ensure_appdata_subdirs(&resolved)?;
+    if let Ok(mut guard) = state.app_data_dir.lock() {
+        *guard = resolved.clone();
+    }
+    Ok(serde_json::json!({
+        "status": "updated",
+        "custom_target_dir": resolved.to_string_lossy(),
+    }))
+}
+
+#[tauri::command]
+fn append_webview_footnote(
+    app: tauri::AppHandle,
+    selected_text: String,
+    source_url: Option<String>,
+) -> Result<String, String> {
+    let base_dir = resolve_app_local_data_dir(Some(&app));
+    ensure_appdata_subdirs(&base_dir)?;
+    let note_path = base_dir.join("vault").join("Renal.md");
+    let existing = std::fs::read_to_string(&note_path).unwrap_or_default();
+    let footnote_line = format!(
+        "
+
+[^webview]: {} (Source: {})
+",
+        selected_text.trim(),
+        source_url.unwrap_or_else(|| "external-webview".to_string())
+    );
+    let updated = format!("{}{}", existing.trim_end(), footnote_line);
+    std::fs::write(&note_path, updated.as_bytes()).map_err(|e| e.to_string())?;
+    Ok("appended".to_string())
 }
 
 #[tauri::command]
@@ -930,6 +999,9 @@ pub fn run() {
             get_mcp_sidecar_status,
             resolve_shorthand_query,
             spawn_custom_ai_panel,
+            get_storage_config,
+            set_custom_storage_dir,
+            append_webview_footnote,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Convergence tauri application");

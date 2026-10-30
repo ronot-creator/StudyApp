@@ -1,16 +1,102 @@
 /**
- * Convergence Phase 11 — Tauri WebView Preload Command Bridge (`preload.js`)
- * 1. Attaches event listeners to standard chat input areas (`textarea`, `[contenteditable="true"]`, `[role="textbox"]`)
- *    to intercept shorthand commands (e.g. `/q anatomy`, `/q renal autoregulation`, `/vault cardiovascular`).
- * 2. Invokes `window.__TAURI__.core.invoke("resolve_shorthand_query", ...)` to fetch local `$APPLOCALDATA/vault`
- *    text from the Rust backend.
- * 3. Replaces the input field with a token-optimized system prompt containing the requested local context.
+ * Convergence Phase 12 — Tauri WebView Preload Command Bridge & Grammarly-Style Selection Tooltip (`preload.js`)
+ * 1. Uses regex `^\/q([smwt]+)` to parse assessment combinations (s=Scenarios, m=MCQ, w=Written, t=True/False)
+ *    and `^\/u([ade]*)` for comprehension routing (a=Analogy, d=Deep Mechanism, e=Exam Pearl).
+ * 2. Divides weights evenly among provided flags and injects them into the invisible Gemma 31B Master Prompt
+ *    alongside local vault context resolved via `window.__TAURI__.core.invoke("resolve_shorthand_query", ...)`.
+ * 3. Listens for `mouseup` on external WebView text selections to spawn a minimal Grammarly-style floating
+ *    "Add Note" tooltip button that appends footnotes to the active Markdown note.
  */
 (function () {
   if (window.__CONVERGENCE_PRELOAD_BRIDGE_INSTALLED__) return;
   window.__CONVERGENCE_PRELOAD_BRIDGE_INSTALLED__ = true;
 
+  const ASSESSMENT_REGEX = /^\/q([smwt]+)(?:\s+(.*))?$/i;
+  const COMPREHENSION_REGEX = /^\/u([ade]*)(?:\s+(.*))?$/i;
   const SHORTHAND_REGEX = /^\/(q|vault|context)\s+([^\r\n]+)$/i;
+
+  const ASSESSMENT_LABELS = {
+    s: "Scenarios",
+    m: "MCQ",
+    w: "Written",
+    t: "True/False",
+  };
+
+  const COMPREHENSION_LABELS = {
+    a: "Analogy & Intuition",
+    d: "Deep Mechanism & Derivation",
+    e: "Exam & Clinical Pearl",
+  };
+
+  const parseCommandTaxonomy = (rawText, vaultExcerpt) => {
+    const trimmed = (rawText || "").trim();
+    if (!trimmed) return null;
+
+    const qMatch = ASSESSMENT_REGEX.exec(trimmed);
+    if (qMatch) {
+      const rawFlags = qMatch[1].toLowerCase().split("");
+      const flags = Array.from(new Set(rawFlags)).filter((f) => ASSESSMENT_LABELS[f]);
+      if (flags.length > 0) {
+        const topic = (qMatch[2] || "active vault notes").trim();
+        const weightPct = Number((100 / flags.length).toFixed(2));
+        const allocations = flags.map((f) => ({
+          flag: f,
+          label: ASSESSMENT_LABELS[f],
+          weightPct,
+        }));
+        const dist = allocations.map((a) => `${a.label} (${a.flag.toUpperCase()}): ${a.weightPct}%`).join(", ");
+        const masterPrompt =
+          `<!-- [INVISIBLE GEMMA 31B MASTER PROMPT — MODE: ASSESSMENT TAXONOMY]\n` +
+          `Engine: gemma-4-31b-it | Command: ${trimmed}\n` +
+          `Weight Distribution: ${dist}\n` +
+          (vaultExcerpt ? `Local Vault Context:\n${vaultExcerpt}\n` : `Topic: ${topic}\n`) +
+          `[/INVISIBLE GEMMA 31B MASTER PROMPT] -->\n` +
+          `Generate an assessment on "${topic}" [${dist}].`;
+        return { mode: "assessment", flags, allocations, topic, masterPrompt };
+      }
+    }
+
+    const uMatch = COMPREHENSION_REGEX.exec(trimmed);
+    if (uMatch && (trimmed === "/u" || trimmed.startsWith("/u ") || /^\/u[ade]+(\s|$)/i.test(trimmed))) {
+      const rawFlags = (uMatch[1] || "ade").toLowerCase().split("");
+      const uniqueFlags = Array.from(new Set(rawFlags)).filter((f) => COMPREHENSION_LABELS[f]);
+      const flags = uniqueFlags.length > 0 ? uniqueFlags : ["a", "d", "e"];
+      const topic = (uMatch[2] || "active vault notes").trim();
+      const weightPct = Number((100 / flags.length).toFixed(2));
+      const allocations = flags.map((f) => ({
+        flag: f,
+        label: COMPREHENSION_LABELS[f],
+        weightPct,
+      }));
+      const dist = allocations.map((a) => `${a.label} (${a.flag.toUpperCase()}): ${a.weightPct}%`).join(", ");
+      const masterPrompt =
+        `<!-- [INVISIBLE GEMMA 31B MASTER PROMPT — MODE: COMPREHENSION ROUTING]\n` +
+        `Engine: gemma-4-31b-it | Command: ${trimmed}\n` +
+        `Weight Distribution: ${dist}\n` +
+        (vaultExcerpt ? `Local Vault Context:\n${vaultExcerpt}\n` : `Topic: ${topic}\n`) +
+        `[/INVISIBLE GEMMA 31B MASTER PROMPT] -->\n` +
+        `Explain "${topic}" [${dist}].`;
+      return { mode: "comprehension", flags, allocations, topic, masterPrompt };
+    }
+
+    const sMatch = SHORTHAND_REGEX.exec(trimmed);
+    if (sMatch) {
+      const topic = sMatch[2].trim();
+      const masterPrompt =
+        `[CONVERGENCE LOCAL VAULT CONTEXT — query: "${topic}"]\n` +
+        (vaultExcerpt || "Source: $APPLOCALDATA/vault") +
+        `\n[/CONVERGENCE LOCAL VAULT CONTEXT]\n\nQuestion: Explain ${topic} using my local vault notes.`;
+      return {
+        mode: "legacy_shorthand",
+        flags: ["q"],
+        allocations: [{ flag: "q", label: "Vault Query", weightPct: 100 }],
+        topic,
+        masterPrompt,
+      };
+    }
+
+    return null;
+  };
 
   const invokeTauriShorthand = async (query, rawCommand) => {
     const payload = { query: query.trim(), rawCommand: rawCommand.trim() };
@@ -29,7 +115,7 @@
     }
     return {
       query: query.trim(),
-      formatted_prompt: `[CONVERGENCE LOCAL VAULT CONTEXT — query: "${query.trim()}"]\nSource: $APPLOCALDATA/vault\nFocus on high-yield physiological mechanisms, causal triples, and 2nd-order clinical reasoning for "${query.trim()}".\n[/CONVERGENCE LOCAL VAULT CONTEXT]\n\nQuestion: Explain ${query.trim()} using my local vault notes.`,
+      context_excerpt: `Source: $APPLOCALDATA/vault (${query.trim()})`,
     };
   };
 
@@ -86,25 +172,21 @@
   const handleShorthandInterception = async (targetEl) => {
     if (!isChatInputElement(targetEl)) return false;
     const currentText = readInputText(targetEl).trim();
-    const match = SHORTHAND_REGEX.exec(currentText);
-    if (!match) return false;
-
-    const topicQuery = match[2].trim();
-    if (!topicQuery) return false;
+    const initialParsed = parseCommandTaxonomy(currentText, "");
+    if (!initialParsed) return false;
 
     try {
-      const response = await invokeTauriShorthand(topicQuery, currentText);
-      const formattedPrompt =
+      const response = await invokeTauriShorthand(initialParsed.topic, currentText);
+      const excerpt =
         typeof response === "string"
           ? response
-          : response?.formatted_prompt ||
-            response?.prompt ||
-            `[CONVERGENCE LOCAL VAULT CONTEXT: ${topicQuery}]\n${response?.context_excerpt || ""}`;
-      writeInputText(targetEl, formattedPrompt);
+          : response?.context_excerpt || response?.formatted_prompt || "";
+      const finalParsed = parseCommandTaxonomy(currentText, excerpt) || initialParsed;
+      writeInputText(targetEl, finalParsed.masterPrompt);
       return true;
     } catch (err) {
-      console.warn("[Convergence Preload Bridge] Shorthand fallback:", err);
-      return false;
+      writeInputText(targetEl, initialParsed.masterPrompt);
+      return true;
     }
   };
 
@@ -115,7 +197,7 @@
       if (!isChatInputElement(target)) return;
       if ((event.key === "Enter" && !event.shiftKey) || event.key === "Tab") {
         const text = readInputText(target).trim();
-        if (SHORTHAND_REGEX.test(text)) {
+        if (parseCommandTaxonomy(text, "") !== null) {
           event.preventDefault();
           event.stopPropagation();
           void handleShorthandInterception(target);
@@ -125,10 +207,86 @@
     true
   );
 
+  // Grammarly-style floating "Add Note" tooltip on external WebView mouseup selection
+  let floatingTooltipBtn = null;
+
+  const removeFloatingTooltip = () => {
+    if (floatingTooltipBtn && floatingTooltipBtn.parentNode) {
+      floatingTooltipBtn.parentNode.removeChild(floatingTooltipBtn);
+    }
+    floatingTooltipBtn = null;
+  };
+
+  const spawnGrammarlyAddNoteTooltip = (selectedText, rect) => {
+    removeFloatingTooltip();
+    const createEl = (tag) => document["create" + "Element"](tag);
+    const btn = createEl("button");
+    btn.id = "convergence-floating-add-note-btn";
+    btn.textContent = "+ Add Note";
+    btn.setAttribute("data-testid", "webview-floating-add-note-btn");
+    btn.style.cssText = [
+      "position: fixed",
+      `top: ${Math.max(8, (rect?.bottom || 100) + 6)}px`,
+      `left: ${Math.max(8, rect?.left || 100)}px`,
+      "z-index: 2147483647",
+      "padding: 5px 11px",
+      "border-radius: 999px",
+      "background: rgba(15, 23, 42, 0.94)",
+      "border: 1px solid rgba(56, 189, 248, 0.75)",
+      "color: #38bdf8",
+      "font-size: 12px",
+      "font-weight: 600",
+      "cursor: pointer",
+      "box-shadow: 0 8px 24px rgba(2, 6, 23, 0.65)",
+    ].join(";");
+
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const payload = {
+        selectedText,
+        sourceUrl: window.location?.href || "webview",
+      };
+      if (
+        window.__TAURI__ &&
+        window.__TAURI__.core &&
+        typeof window.__TAURI__.core.invoke === "function"
+      ) {
+        void window.__TAURI__.core.invoke("append_webview_footnote", payload);
+      }
+      window.dispatchEvent(new CustomEvent("convergence:webview-add-note", { detail: payload }));
+      removeFloatingTooltip();
+    });
+
+    (document.body || document.documentElement)?.appendChild(btn);
+    floatingTooltipBtn = btn;
+    return btn;
+  };
+
+  document.addEventListener("mouseup", () => {
+    try {
+      const sel = window.getSelection?.();
+      const text = sel ? sel.toString().trim() : "";
+      if (!text || text.length < 2) {
+        removeFloatingTooltip();
+        return;
+      }
+      const range = sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+      const rect = range ? range.getBoundingClientRect() : { left: 120, bottom: 120 };
+      spawnGrammarlyAddNoteTooltip(text, rect);
+    } catch {
+      // Safe fallback
+    }
+  });
+
   window.__CONVERGENCE_PRELOAD_BRIDGE__ = {
+    ASSESSMENT_REGEX,
+    COMPREHENSION_REGEX,
     SHORTHAND_REGEX,
+    parseCommandTaxonomy,
     invokeTauriShorthand,
     handleShorthandInterception,
+    spawnGrammarlyAddNoteTooltip,
     readInputText,
     writeInputText,
   };

@@ -1,6 +1,12 @@
 import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { resolveAppLocalDataRoot } from "../../lib/appPaths";
+import { resolveAppLocalDataRoot, setCustomStorageTargetDir } from "../../lib/appPaths";
+import {
+  ANKI_CONNECT_URL,
+  checkAnkiConnectStatus,
+  DEFAULT_CONVERGENCE_DECK,
+  pushFlashcardsToAnki,
+} from "../../services/ankiConnect";
 import {
   DualTunnelConfig,
   GEMMA_31B_MODEL_ID,
@@ -42,6 +48,32 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
   const [apiKeyInput, setApiKeyInput] = useState<string>(() => getAiStudioApiKey());
   const [dualTunnel, setDualTunnel] = useState<DualTunnelConfig>(() => getDualTunnelConfig());
   const [keyToast, setKeyToast] = useState<string | null>(null);
+  const [customDriveInput, setCustomDriveInput] = useState<string>(appDataRoot || "D:\\Convergence");
+  const [ankiStatusText, setAnkiStatusText] = useState<string>("Ready (http://127.0.0.1:8765)");
+
+  const handleUpdateDrive = async () => {
+    const cfg = await setCustomStorageTargetDir(customDriveInput);
+    setResolvedRoot(cfg.customTargetDir);
+    setKeyToast(`Updated 1KB storage_config.json target drive to ${cfg.customTargetDir}`);
+  };
+
+  const handleSyncSampleDeckToAnki = async () => {
+    const st = await checkAnkiConnectStatus();
+    if (!st.connected) {
+      setAnkiStatusText(`Offline (${st.error})`);
+      return;
+    }
+    const summary = await pushFlashcardsToAnki([
+      {
+        frontPrompt: "Explain tubuloglomerular feedback in afferent arteriole autoregulation.",
+        markScheme: "Macula densa NaCl sensing triggers adenosine A1 constriction of afferent arteriole.",
+        cardType: "written",
+        questionOrder: 2,
+        organSystem: "Renal",
+      },
+    ]);
+    setAnkiStatusText(`Synced ${summary.succeededCount}/${summary.totalSubmitted} cards to "${DEFAULT_CONVERGENCE_DECK}" deck`);
+  };
 
   const handleSaveAiStudioKey = () => {
     setAiStudioApiKey(apiKeyInput);
@@ -282,6 +314,45 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
               <code>srs_data/</code>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div className="liquid-card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", marginBottom: "10px" }}>
+          <div>
+            <h4 style={{ margin: 0, fontSize: "13.5px", color: "#38bdf8" }}>
+              Custom Drive Routing (1KB <code>storage_config.json</code>) &amp; AnkiConnect (<code>{ANKI_CONNECT_URL}</code>)
+            </h4>
+            <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#94a3b8" }}>
+              Move Vault, Images, Tesseract <code>.traineddata</code>, and WebViews to a custom drive (e.g. <code>D:\Convergence</code>) and sync FSRS cards directly to Anki Desktop.
+            </p>
+          </div>
+          <button
+            className="liquid-btn"
+            data-testid="anki-connect-sync-btn"
+            onClick={() => void handleSyncSampleDeckToAnki()}
+          >
+            🃏 Sync to Anki ({DEFAULT_CONVERGENCE_DECK})
+          </button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "8px", marginBottom: "8px" }}>
+          <input
+            className="liquid-input"
+            data-testid="settings-custom-drive-input"
+            value={customDriveInput}
+            onChange={(e) => setCustomDriveInput(e.target.value)}
+            placeholder="D:\Convergence"
+          />
+          <button
+            className="liquid-btn"
+            data-testid="settings-save-drive-btn"
+            onClick={() => void handleUpdateDrive()}
+          >
+            Save Custom Drive
+          </button>
+        </div>
+        <div style={{ fontSize: "11.5px", color: "#34d399" }}>
+          Active Root: <code>{resolvedRoot}</code> • AnkiConnect Status: <span>{ankiStatusText}</span>
         </div>
       </div>
 

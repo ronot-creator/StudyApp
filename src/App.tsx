@@ -14,6 +14,11 @@ import { MindMapCanvas } from "./components/mindmap/MindMapCanvas";
 import { AiIntegrations } from "./components/settings/AiIntegrations";
 import { AddAiModal } from "./components/ui/AddAiModal";
 import { Omnibar } from "./components/ui/Omnibar";
+import {
+  ApiKeyErrorBoundary,
+  ApiKeyGuardrailModal,
+  FirstRunDriveWizard,
+} from "./components/ui/ApiKeyGuardrailModal";
 import { ensureAppDataDirectories, resolveAppLocalDataRoot } from "./lib/appPaths";
 import { createSrsCard } from "./lib/fsrs";
 import {
@@ -61,6 +66,7 @@ export default function App() {
     currentProviderObj?.url || "https://gemini.google.com/app"
   );
   const [showAddChatbotModal, setShowAddChatbotModal] = useState<boolean>(false);
+  const [showDriveWizard, setShowDriveWizard] = useState<boolean>(false);
   const [chatbotSearchQuery, setChatbotSearchQuery] = useState<string>("");
   const [customChatbotUrl, setCustomChatbotUrl] = useState<string>("");
 
@@ -313,7 +319,15 @@ export default function App() {
   const searchCandidates = resolveChatbotSearchCandidates(chatbotSearchQuery);
 
   return (
-    <div className="liquid-shell" onMouseMove={handleShellMouseMove}>
+    <ApiKeyErrorBoundary>
+      <ApiKeyGuardrailModal />
+      <FirstRunDriveWizard
+        isOpen={showDriveWizard}
+        currentRoot={appDataRoot}
+        onClose={() => setShowDriveWizard(false)}
+        onDriveUpdated={(nextRoot) => setAppDataRoot(nextRoot)}
+      />
+      <div className="liquid-shell" onMouseMove={handleShellMouseMove}>
       {/* True Apple iOS 26 Liquid Glass SVG Optical Refraction & Fresnel Specular Filter */}
       <svg
         aria-hidden="true"
@@ -418,7 +432,8 @@ export default function App() {
           </button>
         </nav>
 
-        <Omnibar activeTab={activeTab} activeOrganSystem={mindMapSystem} onNavigateTab={(tab) => setActiveTab(tab)} />
+        <button className="liquid-btn liquid-btn-secondary" data-testid="open-drive-wizard-btn" style={{ padding: "5px 10px", fontSize: "11.5px" }} onClick={() => setShowDriveWizard(true)}>💽 Drive: {appDataRoot}</button>
+          <Omnibar activeTab={activeTab} activeOrganSystem={mindMapSystem} onNavigateTab={(tab) => setActiveTab(tab)} />
           <TunnelStatus />
       </header>
 
@@ -869,6 +884,7 @@ export default function App() {
           </div>
         </aside>
       </div>
-    </div>
+      </div>
+    </ApiKeyErrorBoundary>
   );
 }

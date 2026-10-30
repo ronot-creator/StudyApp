@@ -6,6 +6,43 @@ export const GOOGLE_AI_STUDIO_BASE_URL =
 export const AI_STUDIO_KEY_STORAGE = "convergence_google_ai_studio_api_key";
 export const DUAL_TUNNEL_CONFIG_STORAGE = "convergence_dual_tunnel_config_v1";
 
+export const API_NOT_FOUND_CODE = "API_NOT_FOUND";
+export const API_NOT_FOUND_EVENT = "convergence:api-not-found";
+export const KILL_SPINNERS_EVENT = "convergence:kill-loading-spinners";
+
+/**
+ * Custom Circuit-Breaker Error thrown immediately when the Google AI Studio API key is empty.
+ * Caught by `<ApiKeyGuardrailModal />` / `<ApiKeyErrorBoundary />` to kill loading spinners and prompt the user.
+ */
+export class ApiNotFoundError extends Error {
+  public readonly code = API_NOT_FOUND_CODE;
+
+  constructor(message: string = "API_NOT_FOUND: Google AI Studio API key is missing.") {
+    super(message);
+    this.name = API_NOT_FOUND_CODE;
+    Object.setPrototypeOf(this, ApiNotFoundError.prototype);
+  }
+}
+
+export function triggerApiNotFoundGuardrail(reason?: string): never {
+  const err = new ApiNotFoundError(
+    reason || "API_NOT_FOUND: Google AI Studio (Gemma 4 31B IT) API key is empty."
+  );
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+    try {
+      window.dispatchEvent(new CustomEvent(KILL_SPINNERS_EVENT));
+      window.dispatchEvent(
+        new CustomEvent(API_NOT_FOUND_EVENT, {
+          detail: { code: API_NOT_FOUND_CODE, message: err.message },
+        })
+      );
+    } catch {
+      // Ignore in headless environments
+    }
+  }
+  throw err;
+}
+
 export interface DualTunnelConfig {
   primaryEngine: "gemma-4-31b-it";
   secondaryEngine: "fastmcp-sidecar-and-colab-fleet";
@@ -66,10 +103,11 @@ export function setAiStudioApiKey(
 ): void {
   try {
     const trimmed = apiKey.trim();
+    const s = storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined);
     if (trimmed) {
-      (storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined))?.setItem(AI_STUDIO_KEY_STORAGE, trimmed);
+      s?.setItem(AI_STUDIO_KEY_STORAGE, trimmed);
     } else {
-      (storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined))?.removeItem(AI_STUDIO_KEY_STORAGE);
+      s?.removeItem(AI_STUDIO_KEY_STORAGE);
     }
   } catch {
     // Ignore
@@ -110,7 +148,8 @@ export function saveDualTunnelConfig(
     ...config,
   };
   try {
-    (storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined))?.setItem(DUAL_TUNNEL_CONFIG_STORAGE, JSON.stringify(merged));
+    const s = storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined);
+    s?.setItem(DUAL_TUNNEL_CONFIG_STORAGE, JSON.stringify(merged));
   } catch {
     // Ignore
   }
@@ -138,6 +177,9 @@ export function parseStrictJsonResponse<T>(rawText: string): T {
   }
 }
 
+/**
+ * Low-level Google AI Studio (`gemma-4-31b-it`) client with immediate `API_NOT_FOUND` Circuit Breaker.
+ */
 export async function generateWithGemma31b(
   prompt: string,
   systemInstruction?: string,
@@ -150,7 +192,7 @@ export async function generateWithGemma31b(
 ): Promise<string> {
   const apiKey = (options.apiKey ?? getAiStudioApiKey()).trim();
   if (!apiKey) {
-    throw new Error("Google AI Studio API key is not configured.");
+    triggerApiNotFoundGuardrail("API_NOT_FOUND: Google AI Studio API key is empty.");
   }
 
   const fetchFn = options.fetchImpl ?? fetch;
@@ -218,8 +260,8 @@ export async function extractMindMapTriplesWithGemma(
 
   const parsed = parseStrictJsonResponse<{ triples?: Array<Record<string, any>> }>(rawText);
   const rawList = Array.isArray(parsed?.triples) ? parsed.triples : [];
-
   const out: GemmaMindMapTriple[] = [];
+
   for (const item of rawList) {
     const source = String(item.source_node || item.source || "").trim();
     const phrase = String(item.linking_phrase || "")
@@ -275,8 +317,8 @@ export async function generateFsrsCardsWithGemma(
 
   const parsed = parseStrictJsonResponse<{ cards?: Array<Record<string, any>> }>(rawText);
   const rawCards = Array.isArray(parsed?.cards) ? parsed.cards : [];
-
   const outCards: GemmaFsrsCardPayload[] = [];
+
   for (const c of rawCards) {
     const frontPrompt = String(c.frontPrompt || c.front_prompt || "").trim();
     const markScheme = String(c.markScheme || c.mark_scheme || "").trim();
@@ -354,9 +396,13 @@ export async function executeOmnibarCanvasCommand(
   commandPrompt: string,
   activeSystem: OrganSystem,
   currentMarkdown: string,
-  options: { apiKey?: string; fetchImpl?: typeof fetch } = {}
+  options: { apiKey?: string; fetchImpl?: typeof fetch; enforceApiKeyGuardrail?: boolean } = {}
 ): Promise<OmnibarCanvasMutationResponse> {
   const apiKey = (options.apiKey ?? getAiStudioApiKey()).trim();
+  if (!apiKey && options.enforceApiKeyGuardrail) {
+    triggerApiNotFoundGuardrail("API_NOT_FOUND: Google AI Studio API key is required for Gemma 31B Omnibar execution.");
+  }
+
   const localFastMatch = parseConnectCommandLocally(commandPrompt, activeSystem);
 
   if (apiKey) {
