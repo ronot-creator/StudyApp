@@ -9,6 +9,7 @@ import {
   FsrsScheduleOutcome,
 } from "../../lib/fsrs";
 import { getNgrokGrader } from "../../services/ngrokGrader";
+import { InternalStudyMode } from "./InternalStudyMode";
 
 export const FsrsRunner: React.FC = () => {
   const [cards, setCards] = useState<SrsCard[]>([]);
@@ -250,6 +251,8 @@ export const FsrsRunner: React.FC = () => {
           {replayBanner}
         </div>
       )}
+
+      <InternalStudyMode initialCards={visibleCards} />
 
       {/* Deck Toolbar: Organ System Filter + "+ New FSRS Card" */}
       <div

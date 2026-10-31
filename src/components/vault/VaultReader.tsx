@@ -65,6 +65,16 @@ export const VAULT_REHYPE_SANITIZE_SCHEMA = {
  * Sanitizes raw Markdown/HTML before rendering to ensure malicious `<script>`, `<iframe>`,
  * and `onerror`/`onload` attributes are stripped even if raw HTML is embedded in a note.
  */
+export const PDF_DARK_MODE_CSS_FILTER = "invert(1) hue-rotate(180deg)";
+
+/**
+ * Returns the dynamic CSS `filter` string for the PDF.js canvas wrapper:
+ * Applies `invert(1) hue-rotate(180deg)` exclusively when the global theme is set to `"dark"`.
+ */
+export function getPdfDarkModeCanvasFilter(theme: "dark" | "light"): string {
+  return theme === "dark" ? PDF_DARK_MODE_CSS_FILTER : "none";
+}
+
 export function sanitizeVaultMarkdownXss(rawMarkdown: string): string {
   return (rawMarkdown || "")
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
@@ -138,6 +148,7 @@ import { resolveAppDataSubPath } from "../../lib/appPaths";
 import {
   DEFAULT_OCR_LANGUAGE,
   handleReactDropzoneFiles,
+  importFileWithNativeDialog,
   IngestedFileResult,
 } from "../../services/ingestion/fileIngestion";
 import {
@@ -314,6 +325,8 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
   );
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
   const [ingestingStatus, setIngestingStatus] = useState<string | null>(null);
+  const [offloadOcrToColab, setOffloadOcrToColab] = useState<boolean>(false);
+  const [globalTheme, setGlobalTheme] = useState<"dark" | "light">("dark");
   const [recentIngestions, setRecentIngestions] = useState<IngestedFileResult[]>([]);
   const [activeFootnoteOverlay, setActiveFootnoteOverlay] = useState<{
     id: string;
@@ -456,6 +469,7 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
       const results = await handleReactDropzoneFiles(dropped, {
         ocrLang: DEFAULT_OCR_LANGUAGE,
         targetVaultPrefix: activeSystem,
+        offloadHeavyOcrToColab: offloadOcrToColab,
         onProgress: (msg) => setIngestingStatus(msg),
       });
       if (results.length > 0) {
@@ -466,6 +480,31 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
         setEditorEpoch((n) => n + 1);
         setActionToast(
           `Ingested ${results.map((r) => r.originalFilename).join(", ")} into $APPLOCALDATA/vault & $APPLOCALDATA/images (${DEFAULT_OCR_LANGUAGE})`
+        );
+      }
+    } finally {
+      setIngestingStatus(null);
+    }
+  };
+
+  const handleNativeFileImport = async () => {
+    setIngestingStatus("Opening native file dialog (dialog.open)...");
+    try {
+      const res = await importFileWithNativeDialog({
+        ocrLang: DEFAULT_OCR_LANGUAGE,
+        targetVaultPrefix: activeSystem,
+        offloadHeavyOcrToColab: offloadOcrToColab,
+        onProgress: (msg) => setIngestingStatus(msg),
+      });
+      if (res) {
+        setRecentIngestions((prev) => [res, ...prev].slice(0, 5));
+        const nextMd = `${content.trim()}\n\n${res.extractedText}\n`;
+        await handleContentUpdate(nextMd);
+        setEditorEpoch((n) => n + 1);
+        setActionToast(
+          `Imported "${res.originalFilename}" via Stream-and-Discard RAM pipeline (RAM buffer purged: ${Boolean(
+            res.ramBufferPurged
+          )})`
         );
       }
     } finally {
@@ -607,10 +646,55 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
           color: "#cbd5e1",
         }}
       >
-        <div>
-          📥 <strong>Local Drag-and-Drop OCR &amp; PDF Ingestion:</strong> Drop PDFs or Images here to extract via{" "}
-          <code>pdfjs-dist</code> &amp; <code>tesseract.js (lang: &apos;{DEFAULT_OCR_LANGUAGE}&apos;)</code> directly into{" "}
-          <code>$APPLOCALDATA/images</code> &amp; <code>$APPLOCALDATA/vault</code>.
+        <div style={{ display: "flex", flexDirection: "column", gap: "6px", flex: 1 }}>
+          <div>
+            📥 <strong>Stream-and-Discard RAM Ingestion:</strong> Drop PDFs/Images or click{" "}
+            <strong>Import File</strong> to stream in RAM via <code>pdfjs-dist</code> &amp;{" "}
+            <code>tesseract.js</code> (zero <code>raw_assets</code> disk bloat).
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="liquid-btn"
+              data-testid="vault-import-file-btn"
+              style={{ padding: "4px 10px", fontSize: "11.5px" }}
+              onClick={() => void handleNativeFileImport()}
+            >
+              📂 Import File (dialog.open)
+            </button>
+            <label
+              style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "11.5px", color: "#38bdf8", cursor: "pointer" }}
+            >
+              <input
+                type="checkbox"
+                data-testid="offload-ocr-colab-toggle"
+                checked={offloadOcrToColab}
+                onChange={(e) => setOffloadOcrToColab(e.target.checked)}
+              />
+              <span>Offload Heavy OCR to Colab (Ngrok Tunnel POST)</span>
+            </label>
+            <button
+              type="button"
+              className="liquid-btn liquid-btn-secondary"
+              data-testid="toggle-pdf-dark-mode-btn"
+              style={{ padding: "4px 9px", fontSize: "11px" }}
+              onClick={() => setGlobalTheme((t) => (t === "dark" ? "light" : "dark"))}
+            >
+              PDF Theme: {globalTheme === "dark" ? "🌙 Dark (Inverted)" : "☀️ Light"}
+            </button>
+          </div>
+        </div>
+        <div
+          data-testid="pdf-dark-mode-canvas-wrapper"
+          style={{
+            filter: getPdfDarkModeCanvasFilter(globalTheme),
+            padding: "4px 8px",
+            borderRadius: "6px",
+            background: "rgba(15, 23, 42, 0.6)",
+            fontSize: "11px",
+          }}
+        >
+          PDF.js Canvas ({globalTheme} mode)
         </div>
         {ingestingStatus && (
           <span style={{ color: "#38bdf8", fontWeight: 600 }}>{ingestingStatus}</span>

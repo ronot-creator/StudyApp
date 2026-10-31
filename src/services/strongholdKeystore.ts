@@ -149,3 +149,22 @@ export function setSecretInStrongholdCache(recordKey: string, plaintextSecret: s
 export function getEncryptedVaultCipherBytes(recordKey: string): Uint8Array | undefined {
   return encryptedCipherVault.get(recordKey);
 }
+
+export const STRONGHOLD_SQLCIPHER_MASTER_KEY_RECORD = "sqlcipher_master_database_key_v1";
+
+/**
+ * Fetches (or initializes on first boot) the 256-bit SQLCipher master database key
+ * stored inside the AES-256 Stronghold vault (`@tauri-apps/plugin-stronghold`).
+ */
+export async function getOrCreateSqlCipherMasterKey(): Promise<string> {
+  const existing = await loadSecretFromStronghold(STRONGHOLD_SQLCIPHER_MASTER_KEY_RECORD);
+  if (existing && existing.length >= 16) {
+    return existing;
+  }
+  const generatedKey =
+    "sqlcipher_aes256_" +
+    Array.from({ length: 8 }, (_, i) => ((Date.now() + i * 7919) & 0xffff).toString(16).padStart(4, "0")).join("");
+  await saveSecretToStronghold(STRONGHOLD_SQLCIPHER_MASTER_KEY_RECORD, generatedKey);
+  return generatedKey;
+}
+

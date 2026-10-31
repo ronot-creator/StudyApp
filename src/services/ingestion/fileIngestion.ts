@@ -1,16 +1,17 @@
 import {
   BaseDirectory,
-  copyFile,
   exists,
   mkdir,
   readFile,
   writeFile,
   writeTextFile,
 } from "@tauri-apps/plugin-fs";
+import * as dialog from "@tauri-apps/plugin-dialog";
 import { franc } from "franc-min";
 import * as pdfjsLib from "pdfjs-dist";
 import Tesseract from "tesseract.js";
 import { ensureAppDataDirectories, resolveAppDataSubPath } from "../../lib/appPaths";
+import { getNgrokGrader } from "../ngrokGrader";
 
 export const DEFAULT_OCR_LANGUAGE = "eng+ara";
 export const TESSERACT_LANGS_SUBDIR = "tesseract_langs";
@@ -34,7 +35,6 @@ export interface IngestedFileResult {
   uniqueRawAssetPath?: string;
   uniqueRawAssetFilename?: string;
   savedMarkdownPath: string;
-  batchesProcessed?: number;
   savedImagePath?: string;
   ocrLanguage: string;
   detectedIsoLang?: string;
@@ -42,7 +42,10 @@ export interface IngestedFileResult {
   tesseractCachePath?: string;
   localTrainedDataUsed?: boolean;
   pageCount?: number;
+  batchesProcessed?: number;
   confidence?: number;
+  ramBufferPurged?: boolean;
+  offloadedToColab?: boolean;
 }
 
 export interface FileIngestionOptions {
@@ -51,14 +54,38 @@ export interface FileIngestionOptions {
   pageBatchSize?: number;
   timestampSecs?: number;
   shortUuid?: string;
+  offloadHeavyOcrToColab?: boolean;
+  colabTunnelUrl?: string;
+  colabAuthToken?: string;
+  fetchImpl?: typeof fetch;
   onBatchFlushed?: (batchNumber: number, startPage: number, endPage: number) => void;
+  onRamBufferPurged?: (zeroedByteLength: number) => void;
   onProgress?: (status: string) => void;
 }
 
 /**
- * Appends a unique Unix timestamp and 4-character short UUID to a sanitized filename
- * before copying into `raw_assets` (e.g., `anatomy_1701234567_abc1.pdf`) to prevent silent overwrites.
+ * Strict path-traversal sanitization function for incoming filenames.
+ * Strips all relative path modifiers (`..`, `../`, `..\`), directory separators (`/`, `\`),
+ * null bytes, and leading dots.
  */
+export function sanitizeRawAssetFilename(rawFilename: string): string {
+  const withoutNulls = (rawFilename || "").replace(/\0/g, "");
+  let stripped = withoutNulls.replace(/\\/g, "/");
+  while (stripped.includes("..")) {
+    stripped = stripped.replace(/\.\./g, "");
+  }
+  const segments = stripped
+    .split("/")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s !== "." && s !== "..");
+  const base = (segments.pop() || "")
+    .replace(/[\\/]/g, "")
+    .replace(/^\.+/, "")
+    .replace(/[^a-zA-Z0-9._ -]+/g, "_")
+    .trim();
+  return base || `asset_${Date.now()}.bin`;
+}
+
 export function appendUniqueTimestampUuid(
   rawFilename: string,
   timestampSecs: number = Math.floor(Date.now() / 1000),
@@ -79,10 +106,33 @@ export function appendUniqueTimestampUuid(
   return `${safeName}_${timestampSecs}_${cleanUuid}`;
 }
 
+export function sanitizeIngestionStem(filename: string): string {
+  const safeFile = sanitizeRawAssetFilename(filename);
+  const withoutExt = safeFile.replace(/\.[^.]+$/, "");
+  const clean = withoutExt
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return clean || `ingested_${Date.now()}`;
+}
+
 /**
- * Flushes the V8 garbage collector and yields to the macrotask queue between 50-page PDF batches
- * so transient canvas/text buffers are reclaimed and massive medical textbooks never trigger V8 OOM crashes.
+ * Purges a temporary RAM `Uint8Array` buffer by zero-filling every byte in-place
+ * and triggering a V8 GC flush so no residual binary bloat remains in memory or on disk.
  */
+export async function purgeTemporaryRamBuffer(
+  ramBuffer: Uint8Array | null,
+  onPurged?: (byteLength: number) => void
+): Promise<boolean> {
+  if (!ramBuffer) return true;
+  const len = ramBuffer.byteLength;
+  ramBuffer.fill(0);
+  onPurged?.(len);
+  await flushV8GarbageCollectorBetweenBatches();
+  return true;
+}
+
 export async function flushV8GarbageCollectorBetweenBatches(): Promise<void> {
   try {
     const g = globalThis as unknown as { gc?: () => void };
@@ -93,40 +143,6 @@ export async function flushV8GarbageCollectorBetweenBatches(): Promise<void> {
     // Ignore if --expose-gc is not active
   }
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
-}
-
-/**
- * Strict path-traversal sanitization function for incoming filenames.
- * Strips all relative path modifiers (`..`, `../`, `..\`), directory separators (`/`, `\`),
- * null bytes, and leading dots so no asset can escape `$APPLOCALDATA/raw_assets`.
- */
-export function sanitizeRawAssetFilename(rawFilename: string): string {
-  const withoutNulls = (rawFilename || "").replace(/\0/g, "");
-  let stripped = withoutNulls.replace(/\\/g, "/");
-  while (stripped.includes("..")) {
-    stripped = stripped.replace(/\.\./g, "");
-  }
-  const segments = stripped
-    .split("/")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0 && s !== "." && s !== "..");
-  const base = (segments.pop() || "")
-    .replace(/[\\/]/g, "")
-    .replace(/^\.+/, "")
-    .replace(/[^a-zA-Z0-9._ -]+/g, "_")
-    .trim();
-  return base || `asset_${Date.now()}.bin`;
-}
-
-export function sanitizeIngestionStem(filename: string): string {
-  const safeFile = sanitizeRawAssetFilename(filename);
-  const withoutExt = safeFile.replace(/\.[^.]+$/, "");
-  const clean = withoutExt
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return clean || `ingested_${Date.now()}`;
 }
 
 export function takeFirstWords(text: string, limit: number = 50): string {
@@ -227,7 +243,7 @@ export async function resolveTesseractLocalCache(
 
 async function fileToUint8Array(file: File | Blob | Uint8Array): Promise<Uint8Array> {
   if (file instanceof Uint8Array) {
-    return file;
+    return new Uint8Array(file);
   }
   if (typeof (file as Blob).arrayBuffer === "function") {
     const ab = await (file as Blob).arrayBuffer();
@@ -245,6 +261,55 @@ async function fileToUint8Array(file: File | Blob | Uint8Array): Promise<Uint8Ar
     reader.onerror = () => reject(reader.error || new Error("FileReader error"));
     reader.readAsArrayBuffer(file as Blob);
   });
+}
+
+/**
+ * Offloads heavy PDF OCR to the remote Colab Fleet ngrok tunnel via HTTP POST
+ * when the "Offload Heavy OCR to Colab" UI toggle is enabled, returning the extracted Markdown string.
+ */
+export async function offloadPdfOcrToColabTunnel(
+  pdfBytes: Uint8Array,
+  filename: string,
+  options: FileIngestionOptions = {}
+): Promise<string> {
+  const fetchFn = options.fetchImpl ?? fetch;
+  const grader = getNgrokGrader();
+  const rawTunnel = (options.colabTunnelUrl || grader.getTunnelUrl() || "http://127.0.0.1:8080").replace(
+    /\/+$/,
+    ""
+  );
+  const endpoint = `${rawTunnel}/ocr_ingest`;
+
+  let binaryStr = "";
+  const chunkLen = 8192;
+  for (let i = 0; i < pdfBytes.length; i += chunkLen) {
+    binaryStr += String.fromCharCode(...pdfBytes.subarray(i, i + chunkLen));
+  }
+  const base64Pdf = btoa(binaryStr);
+
+  const response = await fetchFn(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "ngrok-skip-browser-warning": "true",
+      ...(options.colabAuthToken ? { "X-Fleet-Token": options.colabAuthToken } : {}),
+    },
+    body: JSON.stringify({
+      filename,
+      ocr_lang: options.ocrLang || DEFAULT_OCR_LANGUAGE,
+      pdf_base64: base64Pdf,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Colab OCR offload failed with HTTP ${response.status}`);
+  }
+  const payload = await response.json();
+  const md = String(payload?.markdown || payload?.extracted_text || payload?.text || "").trim();
+  if (!md) {
+    throw new Error("Colab OCR endpoint returned empty markdown.");
+  }
+  return md;
 }
 
 export async function extractPdfTextLocal(
@@ -426,9 +491,10 @@ export async function extractImageOcrLocal(
 }
 
 /**
- * Non-destructively copies a file by filesystem path into `$APPLOCALDATA/raw_assets/<filename>`
- * after stripping all relative path modifiers (`..`) and slashes (`/`, `\`), processes it in memory
- * through `pdf.js` and `tesseract.js`, and writes strictly the verbatim text output into `$APPLOCALDATA/vault/<stem>.md`.
+ * Stream-and-Discard file ingestion by filesystem path:
+ * Loads the file into a temporary RAM buffer (without duplicating it into `raw_assets/` on disk),
+ * processes it in chunks (or offloads to Colab Fleet if toggled), writes the `.md` Vault note,
+ * and immediately zero-fills/purges the RAM buffer.
  */
 export async function ingestFileByPath(
   sourceFilePath: string,
@@ -441,49 +507,79 @@ export async function ingestFileByPath(
     ? `${sanitizeIngestionStem(options.targetVaultPrefix)}_`
     : "";
   const sanitizedTargetFilename = sanitizeRawAssetFilename(`${prefix}${baseFilename}`);
-  const rawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${sanitizedTargetFilename}`;
   const savedRawAssetPath = await resolveAppDataSubPath(
     RAW_ASSETS_SUBDIR,
     sanitizedTargetFilename
   );
 
+  let fileBytes: Uint8Array | null = null;
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("copy_ingested_raw_asset", {
-      sourcePath: sourceFilePath,
-      fileName: sanitizedTargetFilename,
-    });
-  } catch {
-    try {
-      await mkdir(RAW_ASSETS_SUBDIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
-      await copyFile(sourceFilePath, rawAssetRelPath, {
-        toPathBaseDir: BaseDirectory.AppLocalData,
-      });
-    } catch {
-      // Fallback if running in headless test environment
-    }
-  }
-
-  let fileBytes = new Uint8Array();
-  try {
-    fileBytes = await readFile(rawAssetRelPath, { baseDir: BaseDirectory.AppLocalData });
+    fileBytes = await readFile(sourceFilePath);
   } catch {
     fileBytes = new TextEncoder().encode(sourceFilePath);
   }
 
-  const syntheticFile = new File([fileBytes], baseFilename);
-  const result = await ingestDroppedFile(syntheticFile, options);
-  return {
-    ...result,
-    savedRawAssetPath,
-  };
+  try {
+    const syntheticFile = new File([fileBytes as any], baseFilename);
+    const result = await ingestDroppedFile(syntheticFile, options);
+    return {
+      ...result,
+      savedRawAssetPath,
+      ramBufferPurged: true,
+    };
+  } finally {
+    await purgeTemporaryRamBuffer(fileBytes, options.onRamBufferPurged);
+    fileBytes = null;
+  }
 }
 
 /**
- * Non-destructively copies a dropped `File` into `$APPLOCALDATA/raw_assets/<filename>`
- * after strict path-traversal sanitization (`sanitizeRawAssetFilename`), processes the binary
- * in memory via `pdf.js` and `tesseract.js`, and writes strictly the verbatim extracted text
- * into `$APPLOCALDATA/vault/<stem>.md`.
+ * Opens the native Tauri `dialog.open()` file picker and routes the selected document
+ * through the Stream-and-Discard ingestion pipeline.
+ */
+export async function importFileWithNativeDialog(
+  options: FileIngestionOptions & {
+    fallbackFilePath?: string;
+    dialogOpenFn?: typeof dialog.open;
+  } = {}
+): Promise<IngestedFileResult | null> {
+  const openFn = options.dialogOpenFn ?? dialog.open;
+  let chosenPath: string | null = null;
+  try {
+    const selected = await openFn({
+      directory: false,
+      multiple: false,
+      title: "Import Study Document or Image into Convergence Vault",
+      filters: [
+        {
+          name: "Medical Documents & Images",
+          extensions: ["pdf", "png", "jpg", "jpeg", "webp", "md"],
+        },
+      ],
+    });
+    if (typeof selected === "string" && selected.trim()) {
+      chosenPath = selected.trim();
+    } else if (Array.isArray(selected) && typeof selected[0] === "string") {
+      chosenPath = selected[0].trim();
+    }
+  } catch {
+    chosenPath = options.fallbackFilePath || null;
+  }
+
+  if (!chosenPath && options.fallbackFilePath) {
+    chosenPath = options.fallbackFilePath;
+  }
+  if (!chosenPath) {
+    return null;
+  }
+  return await ingestFileByPath(chosenPath, options);
+}
+
+/**
+ * Stream-and-Discard file ingestion for dropped `File` objects:
+ * Reads the binary into a temporary `Uint8Array` RAM buffer (eliminating `raw_assets` disk duplication),
+ * extracts text in 50-page chunks (or via Colab Fleet HTTP POST when `offloadHeavyOcrToColab` is true),
+ * writes the `.md` note into `$APPLOCALDATA/vault`, and immediately purges the RAM buffer in `finally`.
  */
 export async function ingestDroppedFile(
   file: File,
@@ -503,8 +599,6 @@ export async function ingestDroppedFile(
     options.timestampSecs,
     options.shortUuid
   );
-  const rawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${sanitizedTargetFilename}`;
-  const uniqueRawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${uniqueRawAssetFilename}`;
   const savedRawAssetPath = await resolveAppDataSubPath(
     RAW_ASSETS_SUBDIR,
     sanitizedTargetFilename
@@ -516,24 +610,132 @@ export async function ingestDroppedFile(
   const markdownRelPath = `vault/${prefix}${stem}.md`;
   const savedMarkdownPath = await resolveAppDataSubPath("vault", `${prefix}${stem}.md`);
 
-  const bytes = await fileToUint8Array(file);
+  let ramBuffer: Uint8Array | null = await fileToUint8Array(file);
 
   try {
-    await mkdir(RAW_ASSETS_SUBDIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
-    await writeFile(uniqueRawAssetRelPath, bytes, { baseDir: BaseDirectory.AppLocalData });
-    await writeFile(rawAssetRelPath, bytes, { baseDir: BaseDirectory.AppLocalData });
-  } catch {
-    // Safe fallback in headless environment
-  }
+    const isPdf = lower.endsWith(".pdf") || file.type === "application/pdf";
+    const isImage =
+      /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(lower) || file.type.startsWith("image/");
 
-  const isPdf = lower.endsWith(".pdf") || file.type === "application/pdf";
-  const isImage =
-    /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(lower) || file.type.startsWith("image/");
+    if (isPdf) {
+      if (options.offloadHeavyOcrToColab) {
+        options.onProgress?.("Offloading heavy PDF OCR to Colab Fleet ngrok tunnel...");
+        const colabMarkdown = await offloadPdfOcrToColabTunnel(ramBuffer, filename, options);
+        const verbatimText = colabMarkdown.trim();
+        const first50Words = takeFirstWords(verbatimText, 50);
+        const detected = detectLanguageOffline(first50Words);
+        const tesseractCache = await resolveTesseractLocalCache(detected.tesseractLang);
 
-  if (isPdf) {
-    const { text, pageCount, batchesProcessed, first50Words, detectedLang, tesseractCache } =
-      await extractPdfTextLocal(bytes, options);
-    const verbatimText = text.trim();
+        try {
+          await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
+          await writeTextFile(markdownRelPath, verbatimText, {
+            baseDir: BaseDirectory.AppLocalData,
+          });
+        } catch {
+          // Safe fallback
+        }
+
+        return {
+          originalFilename: filename,
+          fileCategory: "pdf",
+          extractedText: verbatimText,
+          savedRawAssetPath,
+          uniqueRawAssetPath,
+          uniqueRawAssetFilename,
+          savedMarkdownPath,
+          ocrLanguage: detected.tesseractLang,
+          detectedIsoLang: detected.iso639_3,
+          first50WordsSample: first50Words,
+          tesseractCachePath: tesseractCache.cachePath,
+          localTrainedDataUsed: tesseractCache.localTrainedDataAvailable,
+          pageCount: 1,
+          batchesProcessed: 1,
+          ramBufferPurged: true,
+          offloadedToColab: true,
+        };
+      }
+
+      const { text, pageCount, batchesProcessed, first50Words, detectedLang, tesseractCache } =
+        await extractPdfTextLocal(ramBuffer, options);
+      const verbatimText = text.trim();
+
+      try {
+        await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
+        await writeTextFile(markdownRelPath, verbatimText, {
+          baseDir: BaseDirectory.AppLocalData,
+        });
+      } catch {
+        // Safe fallback
+      }
+
+      return {
+        originalFilename: filename,
+        fileCategory: "pdf",
+        extractedText: verbatimText,
+        savedRawAssetPath,
+        uniqueRawAssetPath,
+        uniqueRawAssetFilename,
+        savedMarkdownPath,
+        ocrLanguage: detectedLang,
+        detectedIsoLang: detectedLang,
+        first50WordsSample: first50Words,
+        tesseractCachePath: tesseractCache.cachePath,
+        localTrainedDataUsed: tesseractCache.localTrainedDataAvailable,
+        pageCount,
+        batchesProcessed,
+        ramBufferPurged: true,
+        offloadedToColab: false,
+      };
+    }
+
+    if (isImage) {
+      const imageExt = (filename.match(/\.[a-zA-Z0-9]+$/) || [".png"])[0].toLowerCase();
+      const imageRelPath = `images/${prefix}${stem}${imageExt}`;
+      const savedImagePath = await resolveAppDataSubPath("images", `${prefix}${stem}${imageExt}`);
+
+      try {
+        await mkdir("images", { baseDir: BaseDirectory.AppLocalData, recursive: true });
+        await writeFile(imageRelPath, ramBuffer, { baseDir: BaseDirectory.AppLocalData });
+      } catch {
+        // Safe fallback
+      }
+
+      const ocrResult = await extractImageOcrLocal(ramBuffer, options);
+      const detected = detectLanguageOffline(ocrResult.text);
+      const verbatimText = ocrResult.text.trim();
+
+      try {
+        await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
+        await writeTextFile(markdownRelPath, verbatimText, {
+          baseDir: BaseDirectory.AppLocalData,
+        });
+      } catch {
+        // Safe fallback
+      }
+
+      return {
+        originalFilename: filename,
+        fileCategory: "image",
+        extractedText: verbatimText,
+        savedRawAssetPath,
+        uniqueRawAssetPath,
+        uniqueRawAssetFilename,
+        savedMarkdownPath,
+        savedImagePath,
+        ocrLanguage: ocrResult.ocrLanguage,
+        detectedIsoLang: detected.iso639_3,
+        tesseractCachePath: ocrResult.tesseractCache.cachePath,
+        localTrainedDataUsed: ocrResult.tesseractCache.localTrainedDataAvailable,
+        confidence: ocrResult.confidence,
+        ramBufferPurged: true,
+        offloadedToColab: false,
+      };
+    }
+
+    const verbatimText = new TextDecoder("utf-8", { fatal: false }).decode(ramBuffer).trim();
+    const first50 = takeFirstWords(verbatimText, 50);
+    const detected = detectLanguageOffline(first50);
+    const tesseractCache = await resolveTesseractLocalCache(detected.tesseractLang);
 
     try {
       await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
@@ -546,88 +748,24 @@ export async function ingestDroppedFile(
 
     return {
       originalFilename: filename,
-      fileCategory: "pdf",
+      fileCategory: "markdown",
       extractedText: verbatimText,
       savedRawAssetPath,
       uniqueRawAssetPath,
       uniqueRawAssetFilename,
       savedMarkdownPath,
-      ocrLanguage: detectedLang,
-      detectedIsoLang: detectedLang,
-      first50WordsSample: first50Words,
+      ocrLanguage: detected.tesseractLang,
+      detectedIsoLang: detected.iso639_3,
+      first50WordsSample: first50,
       tesseractCachePath: tesseractCache.cachePath,
       localTrainedDataUsed: tesseractCache.localTrainedDataAvailable,
-      pageCount,
-      batchesProcessed,
+      ramBufferPurged: true,
+      offloadedToColab: false,
     };
+  } finally {
+    await purgeTemporaryRamBuffer(ramBuffer, options.onRamBufferPurged);
+    ramBuffer = null;
   }
-
-  if (isImage) {
-    const imageExt = (filename.match(/\.[a-zA-Z0-9]+$/) || [".png"])[0].toLowerCase();
-    const imageRelPath = `images/${prefix}${stem}${imageExt}`;
-    const savedImagePath = await resolveAppDataSubPath("images", `${prefix}${stem}${imageExt}`);
-
-    try {
-      await mkdir("images", { baseDir: BaseDirectory.AppLocalData, recursive: true });
-      await writeFile(imageRelPath, bytes, { baseDir: BaseDirectory.AppLocalData });
-    } catch {
-      // Safe fallback
-    }
-
-    const ocrResult = await extractImageOcrLocal(bytes, options);
-    const detected = detectLanguageOffline(ocrResult.text);
-    const verbatimText = ocrResult.text.trim();
-
-    try {
-      await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
-      await writeTextFile(markdownRelPath, verbatimText, {
-        baseDir: BaseDirectory.AppLocalData,
-      });
-    } catch {
-      // Safe fallback
-    }
-
-    return {
-      originalFilename: filename,
-      fileCategory: "image",
-      extractedText: verbatimText,
-      savedRawAssetPath,
-      savedMarkdownPath,
-      savedImagePath,
-      ocrLanguage: ocrResult.ocrLanguage,
-      detectedIsoLang: detected.iso639_3,
-      tesseractCachePath: ocrResult.tesseractCache.cachePath,
-      localTrainedDataUsed: ocrResult.tesseractCache.localTrainedDataAvailable,
-      confidence: ocrResult.confidence,
-    };
-  }
-
-  const verbatimText = new TextDecoder("utf-8", { fatal: false }).decode(bytes).trim();
-  const first50 = takeFirstWords(verbatimText, 50);
-  const detected = detectLanguageOffline(first50);
-  const tesseractCache = await resolveTesseractLocalCache(detected.tesseractLang);
-
-  try {
-    await mkdir("vault", { baseDir: BaseDirectory.AppLocalData, recursive: true });
-    await writeTextFile(markdownRelPath, verbatimText, {
-      baseDir: BaseDirectory.AppLocalData,
-    });
-  } catch {
-    // Safe fallback
-  }
-
-  return {
-    originalFilename: filename,
-    fileCategory: "markdown",
-    extractedText: verbatimText,
-    savedRawAssetPath,
-    savedMarkdownPath,
-    ocrLanguage: detected.tesseractLang,
-    detectedIsoLang: detected.iso639_3,
-    first50WordsSample: first50,
-    tesseractCachePath: tesseractCache.cachePath,
-    localTrainedDataUsed: tesseractCache.localTrainedDataAvailable,
-  };
 }
 
 export async function handleReactDropzoneFiles(

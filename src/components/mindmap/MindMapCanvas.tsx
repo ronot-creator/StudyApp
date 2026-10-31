@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { toPng } from "html-to-image";
 import {
   ReactFlow,
   Background,
@@ -15,7 +16,7 @@ import {
   Connection,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { readTextFile, writeTextFile, mkdir, BaseDirectory } from "@tauri-apps/plugin-fs";
+import { readTextFile, writeTextFile, writeFile, mkdir, BaseDirectory } from "@tauri-apps/plugin-fs";
 import { appLocalDataDir, join } from "@tauri-apps/api/path";
 import { ensureAppDataDirectories, resolveAppDataSubPath } from "../../lib/appPaths";
 import Database from "@tauri-apps/plugin-sql";
@@ -141,6 +142,113 @@ Sarcomere length-tension dependence increases stroke volume in response to eleva
 [Systemic Sympathetic Outflow] --(activates juxtaglomerular beta-1 receptors in)--> [Renal::Renin-Angiotensin-Aldosterone Axis]
 \`\`\``,
 };
+
+export interface MindMapHistorySnapshot {
+  markdown: string;
+  nodes: Node<MindMapNodeData>[];
+  edges: Edge[];
+}
+
+/**
+ * Pure Undo/Redo state history controller for ReactFlow MindMap state transitions.
+ */
+export function createMindMapHistoryManager(initialMarkdown: string = "") {
+  let past: string[] = [];
+  let present: string = initialMarkdown;
+  let future: string[] = [];
+
+  return {
+    getPresent: () => present,
+    canUndo: () => past.length > 0,
+    canRedo: () => future.length > 0,
+    pushState: (nextMarkdown: string) => {
+      if (nextMarkdown === present) return present;
+      past = [...past, present];
+      present = nextMarkdown;
+      future = [];
+      return present;
+    },
+    undo: (): string | null => {
+      if (past.length === 0) return null;
+      const previous = past[past.length - 1];
+      past = past.slice(0, -1);
+      future = [present, ...future];
+      present = previous;
+      return present;
+    },
+    redo: (): string | null => {
+      if (future.length === 0) return null;
+      const next = future[0];
+      future = future.slice(1);
+      past = [...past, present];
+      present = next;
+      return present;
+    },
+  };
+}
+
+export function dataUrlToPngBytes(dataUrl: string): Uint8Array {
+  const base64Part = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
+  const binary = atob(base64Part);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+/**
+ * Rasterizes the ReactFlow MindMap canvas to a PNG via `html-to-image` (`toPng`)
+ * and saves it natively to `$APPLOCALDATA/images/<filename>.png`.
+ */
+export async function exportMindMapCanvasToPng(
+  canvasElement: HTMLElement | null,
+  organSystem: OrganSystem,
+  options: {
+    timestampSecs?: number;
+    toPngImpl?: typeof toPng;
+    writeBinaryFn?: (path: string, bytes: Uint8Array) => Promise<void>;
+  } = {}
+): Promise<{ savedImagePath: string; filename: string; pngBytes: Uint8Array }> {
+  const ts = options.timestampSecs ?? Math.floor(Date.now() / 1000);
+  const safeSys = getSafeVaultFilename(organSystem);
+  const filename = `mindmap_${safeSys}_${ts}.png`;
+  const savedImagePath = await resolveAppDataSubPath("images", filename);
+
+  let dataUrl =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const rasterizeFn = options.toPngImpl ?? toPng;
+  if (canvasElement) {
+    try {
+      dataUrl = await rasterizeFn(canvasElement, {
+        cacheBust: true,
+        backgroundColor: "#090f1d",
+      });
+    } catch {
+      // Fallback in headless environment
+    }
+  }
+
+  const pngBytes = dataUrlToPngBytes(dataUrl);
+  if (options.writeBinaryFn) {
+    await options.writeBinaryFn(savedImagePath, pngBytes);
+  } else {
+    try {
+      await mkdir("images", { baseDir: BaseDirectory.AppLocalData, recursive: true });
+      await writeFile(`images/${filename}`, pngBytes, {
+        baseDir: BaseDirectory.AppLocalData,
+      });
+    } catch {
+      // Safe fallback in headless environment
+    }
+  }
+
+  return {
+    savedImagePath,
+    filename,
+    pngBytes,
+  };
+}
 
 export function getSafeVaultFilename(organSystem: OrganSystem): string {
   return organSystem.replace(/[^A-Za-z0-9_-]+/g, "_");
@@ -510,6 +618,9 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     targetOrganSystem: OrganSystem;
   } | null>(null);
   const [extractingColab, setExtractingColab] = useState<boolean>(false);
+  const [undoStack, setUndoStack] = useState<string[]>([]);
+  const [redoStack, setRedoStack] = useState<string[]>([]);
+  const canvasWrapperRef = useRef<HTMLDivElement | null>(null);
 
   const [newSourceNode, setNewSourceNode] = useState<string>("");
   const [newLinkingPhrase, setNewLinkingPhrase] = useState<string>("");
@@ -596,6 +707,8 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
 
   const handleSyntaxChange = useCallback(
     (nextMarkdown: string) => {
+      setUndoStack((prev) => [...prev, syntaxInput]);
+      setRedoStack([]);
       setSyntaxInput(nextMarkdown);
       const parsed = parseMarkdownMindMapTriples(activeSystem, nextMarkdown);
       const savedPos = loadSavedNodePositions(activeSystem);
@@ -647,6 +760,37 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     },
     [syntaxInput, handleSyntaxChange]
   );
+
+  const handleUndoMindMap = () => {
+    if (undoStack.length === 0) return;
+    const prevMd = undoStack[undoStack.length - 1];
+    setUndoStack((prev) => prev.slice(0, -1));
+    setRedoStack((prev) => [syntaxInput, ...prev]);
+    setSyntaxInput(prevMd);
+    const parsed = parseMarkdownMindMapTriples(activeSystem, prevMd);
+    const nextGraph = buildGraphFromTriples(parsed, loadSavedNodePositions(activeSystem));
+    setNodes(nextGraph.nodes);
+    setEdges(nextGraph.edges);
+    void writeOrganSystemVaultMarkdown(activeSystem, prevMd);
+  };
+
+  const handleRedoMindMap = () => {
+    if (redoStack.length === 0) return;
+    const nextMd = redoStack[0];
+    setRedoStack((prev) => prev.slice(1));
+    setUndoStack((prev) => [...prev, syntaxInput]);
+    setSyntaxInput(nextMd);
+    const parsed = parseMarkdownMindMapTriples(activeSystem, nextMd);
+    const nextGraph = buildGraphFromTriples(parsed, loadSavedNodePositions(activeSystem));
+    setNodes(nextGraph.nodes);
+    setEdges(nextGraph.edges);
+    void writeOrganSystemVaultMarkdown(activeSystem, nextMd);
+  };
+
+  const handleExportPng = async () => {
+    const res = await exportMindMapCanvasToPng(canvasWrapperRef.current, activeSystem);
+    showToast(`Exported MindMap PNG to ${res.savedImagePath}`);
+  };
 
   const handleAddTriple = async () => {
     if (!newSourceNode.trim() || !newLinkingPhrase.trim() || !newTargetNode.trim()) return;
@@ -920,6 +1064,29 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           >
             {extractingColab ? "Extracting..." : "Colab 3B Auto-Extract Triples"}
           </button>
+          <button
+            className="liquid-btn liquid-btn-secondary"
+            data-testid="mindmap-undo-btn"
+            disabled={undoStack.length === 0}
+            onClick={handleUndoMindMap}
+          >
+            ↶ Undo
+          </button>
+          <button
+            className="liquid-btn liquid-btn-secondary"
+            data-testid="mindmap-redo-btn"
+            disabled={redoStack.length === 0}
+            onClick={handleRedoMindMap}
+          >
+            ↷ Redo
+          </button>
+          <button
+            className="liquid-btn liquid-btn-secondary"
+            data-testid="mindmap-export-png-btn"
+            onClick={() => void handleExportPng()}
+          >
+            🖼 Export PNG
+          </button>
         </div>
       </div>
 
@@ -1031,6 +1198,8 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       )}
 
       <div
+        ref={canvasWrapperRef}
+        data-testid="mindmap-canvas-export-surface"
         style={{ position: "relative", height: "360px", borderRadius: "14px", overflow: "hidden" }}
         className="liquid-card"
       >

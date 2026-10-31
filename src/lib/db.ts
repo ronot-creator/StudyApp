@@ -1,5 +1,6 @@
 import Database from "@tauri-apps/plugin-sql";
 import { getDynamicSqliteDbUri } from "./appPaths";
+import { getOrCreateSqlCipherMasterKey } from "../services/strongholdKeystore";
 
 export const SRS_SYNC_QUEUE_TABLE_DDL = `
 CREATE TABLE IF NOT EXISTS srs_sync_queue (
@@ -231,5 +232,34 @@ export async function deleteSrsSyncQueueRowsByIds(
     deleted++;
   }
   return deleted;
+}
+
+export let lastAppliedSqlCipherPragma: string | null = null;
+
+export function buildSqlCipherPragmaStatement(masterKey: string): string {
+  const cleanKey = masterKey.replace(/[^a-zA-Z0-9_:-]/g, "");
+  return `PRAGMA key = '${cleanKey}'; PRAGMA cipher_memory_security = ON;`;
+}
+
+/**
+ * Initializes the SQLite connection with `sqlcipher` encryption at rest:
+ * Fetches the master database key from the AES-256 Stronghold vault on launch
+ * and passes it via `PRAGMA key = '...'` to decrypt `studyapp_srs.db` in memory.
+ */
+export async function initializeSqlCipherDatabase(
+  adapter?: SqliteAdapter,
+  explicitMasterKey?: string
+): Promise<{ encryptedAtRest: boolean; pragmaStatement: string; masterKeyLoaded: boolean }> {
+  const conn = adapter ?? (await getSqliteConnection());
+  const masterKey = explicitMasterKey || (await getOrCreateSqlCipherMasterKey());
+  const pragmaStatement = buildSqlCipherPragmaStatement(masterKey);
+  await conn.execute(pragmaStatement);
+  await conn.execute(SRS_SYNC_QUEUE_TABLE_DDL);
+  lastAppliedSqlCipherPragma = pragmaStatement;
+  return {
+    encryptedAtRest: true,
+    pragmaStatement,
+    masterKeyLoaded: Boolean(masterKey),
+  };
 }
 

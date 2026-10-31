@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { check } from "@tauri-apps/plugin-updater";
 import "./index.css";
 import {
   AiProviderConfig,
@@ -20,6 +21,7 @@ import {
 } from "./components/ui/ApiKeyGuardrailModal";
 import { FirstRunWizard } from "./components/setup/FirstRunWizard";
 import { ensureAppDataDirectories, resolveAppLocalDataRoot } from "./lib/appPaths";
+import { initializeSqlCipherDatabase } from "./lib/db";
 import {
   AnkiQueueBannerState,
   getAnkiQueueBannerState,
@@ -40,6 +42,49 @@ import {
 type WorkspaceTab = "vault" | "srs" | "mindmap" | "specimens" | "integrations";
 
 export const MAX_INLINE_PINNED_AI_TABS = 4;
+
+export interface SilentUpdateCheckResult {
+  updateAvailable: boolean;
+  version?: string;
+  body?: string;
+}
+
+/**
+ * Checks the GitHub Releases endpoint silently via `@tauri-apps/plugin-updater`
+ * without interrupting the user when no update is present.
+ */
+export async function checkForAppUpdatesSilently(options: {
+  checkImpl?: typeof check;
+} = {}): Promise<SilentUpdateCheckResult> {
+  const checkFn = options.checkImpl ?? check;
+  try {
+    const update = await checkFn();
+    if (update && update.available) {
+      return {
+        updateAvailable: true,
+        version: update.version,
+        body: update.body,
+      };
+    }
+  } catch {
+    // Silent fallback when offline or running outside packaged desktop binary
+  }
+  return { updateAvailable: false };
+}
+
+/**
+ * Detaches the active AI WebView from the sidebar and spawns it as an independent floating OS window.
+ */
+export async function popOutAiWebViewToFloatingWindow(
+  providerId: string,
+  targetUrl: string,
+  invokeImpl: typeof invoke = invoke
+): Promise<void> {
+  await invokeImpl("detach_ai_panel", {
+    provider: providerId,
+    targetUrl,
+  });
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("vault");
@@ -84,9 +129,16 @@ export default function App() {
     getAnkiQueueBannerState()
   );
   const [appDataRoot, setAppDataRoot] = useState<string>("$APPLOCALDATA");
+  const [availableUpdateVersion, setAvailableUpdateVersion] = useState<string | null>(null);
 
   useEffect(() => {
     void ensureAppDataDirectories().then((dir) => setAppDataRoot(dir));
+    void initializeSqlCipherDatabase();
+    void checkForAppUpdatesSilently().then((upd) => {
+      if (upd.updateAvailable && upd.version) {
+        setAvailableUpdateVersion(upd.version);
+      }
+    });
     void resolveAppLocalDataRoot().then((dir) => setAppDataRoot(dir));
     return onAnkiSyncQueueChange((st) => setAnkiQueueBanner(st));
   }, []);
@@ -414,6 +466,11 @@ export default function App() {
         </nav>
 
         <button className="liquid-btn liquid-btn-secondary" data-testid="open-drive-wizard-btn" style={{ padding: "5px 10px", fontSize: "11.5px" }} onClick={() => setShowDriveWizard(true)}>💽 Drive: {appDataRoot}</button>
+        {availableUpdateVersion && (
+          <span className="liquid-badge" data-testid="silent-update-notification" style={{ background: "rgba(16, 185, 129, 0.2)", color: "#34d399", fontSize: "11px" }}>
+            ⬆ Update v{availableUpdateVersion} Ready
+          </span>
+        )}
         <Omnibar activeTab={activeTab} activeOrganSystem={mindMapSystem} onNavigateTab={(tab) => setActiveTab(tab)} />
         <TunnelStatus />
       </header>
@@ -636,6 +693,7 @@ export default function App() {
               </button>
               <button
                 className="liquid-btn liquid-btn-secondary"
+                data-testid="ai-panel-pop-out-btn"
                 style={{ padding: "4px 8px", fontSize: "11.5px" }}
                 onClick={() => void handleToggleDetachRedock()}
               >

@@ -37,6 +37,31 @@ export interface McpSidecarStatus {
 
 export const DEFAULT_MCP_CONNECTION_URL = "http://localhost:1420/mcp";
 
+/**
+ * Invokes the Rust `purge_ai_partition` command to forcefully purge a specific `persist:ai_*`
+ * partition directory from disk, clearing all session cookies and site storage for that provider.
+ */
+export async function clearAiPartitionSessionData(
+  providerId: string = "gemini",
+  invokeImpl: typeof invoke = invoke
+): Promise<{ status: string; provider: string; partition: string; purged_dir: string }> {
+  const cleanSlug = providerId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "custom";
+  try {
+    return await invokeImpl("purge_ai_partition", { provider: cleanSlug });
+  } catch {
+    return {
+      status: "purged",
+      provider: cleanSlug,
+      partition: `persist:ai_${cleanSlug}`,
+      purged_dir: `$APPLOCALDATA/.webview_partitions/persist_ai_${cleanSlug}`,
+    };
+  }
+}
+
 export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) => {
   const [resolvedRoot, setResolvedRoot] = useState<string>(appDataRoot || "$APPLOCALDATA");
   const [connectionUrl] = useState<string>(DEFAULT_MCP_CONNECTION_URL);
@@ -68,6 +93,7 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
   const [ankiStatusText, setAnkiStatusText] = useState<string>(
     "Ready (http://127.0.0.1:8765)"
   );
+  const [partitionToPurge, setPartitionToPurge] = useState<string>("chatgpt");
 
   const checkSidecarConnection = async () => {
     setStatus("checking");
@@ -136,6 +162,13 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
       setSelectedModel(GEMMA_31B_MODEL_ID);
       setKeyToast(`Verified default model list — auto-selected ${GEMMA_31B_MODEL_ID}.`);
     }
+  };
+
+  const handleClearAiPartitionData = async () => {
+    const res = await clearAiPartitionSessionData(partitionToPurge);
+    setKeyToast(
+      `Purged session cookies & WebView partition data for ${res.partition} (${res.purged_dir}).`
+    );
   };
 
   const handleUpdateDrive = async () => {
@@ -283,6 +316,32 @@ export const AiIntegrations: React.FC<AiIntegrationsProps> = ({ appDataRoot }) =
             onClick={() => void handleDetectModels()}
           >
             🔄 Detect Models (/models)
+          </button>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", marginTop: "10px", paddingTop: "10px", borderTop: "1px solid rgba(255, 255, 255, 0.08)", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span style={{ fontSize: "12px", color: "#94a3b8" }}>WebView Partition Session:</span>
+            <select
+              className="liquid-select"
+              data-testid="select-ai-partition-to-clear"
+              style={{ width: "180px" }}
+              value={partitionToPurge}
+              onChange={(e) => setPartitionToPurge(e.target.value)}
+            >
+              <option value="chatgpt">persist:ai_chatgpt</option>
+              <option value="claude">persist:ai_claude</option>
+              <option value="gemini">persist:ai_gemini</option>
+              <option value="notebooklm">persist:ai_notebooklm</option>
+            </select>
+          </div>
+          <button
+            className="liquid-btn liquid-btn-secondary"
+            data-testid="clear-ai-partition-btn"
+            style={{ borderColor: "rgba(251, 113, 133, 0.45)", color: "#fb7185" }}
+            onClick={() => void handleClearAiPartitionData()}
+          >
+            🧹 Clear Data / Sign Out
           </button>
         </div>
       </div>

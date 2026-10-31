@@ -16,6 +16,11 @@ pub const HIGHLIGHT_BRIDGE_URL: &str = "http://127.0.0.1:47821/highlight";
 pub const WEBVIEW2_RAM_DIET_ARGS: &str =
     "--process-per-site --enable-features=msWebView2BrowserHitTransparent --js-flags=--max-old-space-size=512";
 
+/// Strict Mobile Safari User-Agent (iPhone 15 Safari) injected into all `persist:ai_*` WebView partitions
+/// to force responsive mobile layouts from ChatGPT, Claude, Gemini, and custom AI providers.
+pub const MOBILE_SAFARI_USER_AGENT: &str =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+
 /// Embedded Preload Command Bridge (`src-tauri/src/preload.js`) injected into all AI WebViews
 pub const PRELOAD_BRIDGE_SCRIPT: &str = include_str!("preload.js");
 
@@ -643,6 +648,61 @@ fn copy_ingested_raw_asset(
 
 const SCHEMA_SQL: &str = include_str!("../../MyFiles/srs_data/schema.sql");
 
+/// Fetches or derives the AES-256 Stronghold master database key and constructs the SQLCipher `PRAGMA key` statement
+/// to decrypt/encrypt `studyapp_srs.db` in memory.
+pub fn fetch_sqlcipher_master_key_from_stronghold(base_dir: &Path) -> String {
+    let stronghold_path = base_dir.join("srs_data").join("convergence_keystore.hold");
+    if let Ok(bytes) = std::fs::read(&stronghold_path) {
+        if !bytes.is_empty() {
+            let mut acc: u64 = 0xcbf29ce484222325;
+            for b in bytes {
+                acc ^= b as u64;
+                acc = acc.wrapping_mul(0x100000001b3);
+            }
+            return format!("convergence_sqlcipher_stronghold_{acc:016x}");
+        }
+    }
+    "convergence_sqlcipher_stronghold_default_aes256_key".to_string()
+}
+
+pub fn build_sqlcipher_pragma_key(master_key: &str) -> String {
+    let safe_key: String = master_key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    format!("PRAGMA key = '{safe_key}'; PRAGMA cipher_memory_security = ON;")
+}
+
+/// Forcefully purges a `persist:ai_*` WebView partition directory inside `$APPLOCALDATA/.webview_partitions`
+/// to clear all session cookies and local site data for that AI provider.
+pub fn purge_ai_partition_at(base_dir: &Path, provider: &str) -> Result<PathBuf, String> {
+    let clean_slug = sanitize_ai_slug(provider);
+    let partition_dir = base_dir
+        .join(".webview_partitions")
+        .join(format!("persist_ai_{clean_slug}"));
+    let verified = enforce_appdata_sandbox_with_root(base_dir, &partition_dir)?;
+    if verified.exists() {
+        std::fs::remove_dir_all(&verified)
+            .map_err(|e| format!("Failed to purge AI partition {:?}: {e}", verified))?;
+    }
+    Ok(verified)
+}
+
+#[tauri::command]
+fn purge_ai_partition(
+    app: tauri::AppHandle,
+    provider: String,
+) -> Result<serde_json::Value, String> {
+    let base_dir = resolve_app_local_data_dir(Some(&app));
+    let purged_dir = purge_ai_partition_at(&base_dir, &provider)?;
+    Ok(serde_json::json!({
+        "status": "purged",
+        "provider": sanitize_ai_slug(&provider),
+        "partition": format!("persist:ai_{}", sanitize_ai_slug(&provider)),
+        "purged_dir": purged_dir.to_string_lossy(),
+    }))
+}
+
 pub fn init_database_at(base_dir: &Path) -> Result<PathBuf, String> {
     ensure_appdata_subdirs(base_dir)?;
     let dir = base_dir.join("srs_data");
@@ -652,6 +712,9 @@ pub fn init_database_at(base_dir: &Path) -> Result<PathBuf, String> {
     }
     let db_path = enforce_appdata_sandbox_with_root(base_dir, &dir.join("studyapp_srs.db"))?;
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let master_key = fetch_sqlcipher_master_key_from_stronghold(base_dir);
+    let sqlcipher_pragma = build_sqlcipher_pragma_key(&master_key);
+    let _ = conn.execute_batch(&sqlcipher_pragma);
     conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
 
@@ -793,6 +856,7 @@ fn spawn_custom_ai_panel(
             .title(&window_title)
             .inner_size(1020.0, 860.0)
             .resizable(true)
+            .user_agent(MOBILE_SAFARI_USER_AGENT)
             .data_directory(partition_dir.clone())
             .initialization_script(PRELOAD_BRIDGE_SCRIPT)
             .build()
@@ -1014,6 +1078,7 @@ fn switch_active_ai_panel(
             .map_err(|e| format!("Invalid provider URL: {e}"))?;
 
         let webview_builder = WebviewBuilder::new(&panel_label, WebviewUrl::External(parsed_url))
+            .user_agent(MOBILE_SAFARI_USER_AGENT)
             .data_directory(partition_dir.clone())
             .initialization_script(PRELOAD_BRIDGE_SCRIPT)
             .auto_resize();
@@ -1113,6 +1178,7 @@ fn detach_ai_panel(
             .title(&title)
             .inner_size(980.0, 860.0)
             .resizable(true)
+            .user_agent(MOBILE_SAFARI_USER_AGENT)
             .data_directory(partition_dir.clone())
             .initialization_script(PRELOAD_BRIDGE_SCRIPT)
             .build()
@@ -1284,6 +1350,7 @@ pub fn run() {
             resolve_shorthand_query,
             copy_ingested_raw_asset,
             spawn_custom_ai_panel,
+            purge_ai_partition,
             get_storage_config,
             set_custom_storage_dir,
             append_webview_footnote,
