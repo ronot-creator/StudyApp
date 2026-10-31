@@ -15,6 +15,7 @@ import { ensureAppDataDirectories, resolveAppDataSubPath } from "../../lib/appPa
 export const DEFAULT_OCR_LANGUAGE = "eng+ara";
 export const TESSERACT_LANGS_SUBDIR = "tesseract_langs";
 export const RAW_ASSETS_SUBDIR = "raw_assets";
+export const PDF_PAGE_BATCH_SIZE = 50;
 
 export type SupportedOcrLang = "eng" | "ara" | "spa" | "eng+ara" | "eng+spa";
 
@@ -30,7 +31,10 @@ export interface IngestedFileResult {
   fileCategory: "pdf" | "image" | "markdown";
   extractedText: string;
   savedRawAssetPath: string;
+  uniqueRawAssetPath?: string;
+  uniqueRawAssetFilename?: string;
   savedMarkdownPath: string;
+  batchesProcessed?: number;
   savedImagePath?: string;
   ocrLanguage: string;
   detectedIsoLang?: string;
@@ -44,7 +48,51 @@ export interface IngestedFileResult {
 export interface FileIngestionOptions {
   ocrLang?: string;
   targetVaultPrefix?: string;
+  pageBatchSize?: number;
+  timestampSecs?: number;
+  shortUuid?: string;
+  onBatchFlushed?: (batchNumber: number, startPage: number, endPage: number) => void;
   onProgress?: (status: string) => void;
+}
+
+/**
+ * Appends a unique Unix timestamp and 4-character short UUID to a sanitized filename
+ * before copying into `raw_assets` (e.g., `anatomy_1701234567_abc1.pdf`) to prevent silent overwrites.
+ */
+export function appendUniqueTimestampUuid(
+  rawFilename: string,
+  timestampSecs: number = Math.floor(Date.now() / 1000),
+  shortUuid: string = Math.random().toString(16).slice(2, 6).padEnd(4, "0")
+): string {
+  const safeName = sanitizeRawAssetFilename(rawFilename);
+  const cleanUuid =
+    shortUuid
+      .replace(/[^a-zA-Z0-9]/g, "")
+      .toLowerCase()
+      .slice(0, 4) || "abc1";
+  const dotIdx = safeName.lastIndexOf(".");
+  if (dotIdx > 0 && dotIdx < safeName.length - 1) {
+    const stem = safeName.slice(0, dotIdx);
+    const ext = safeName.slice(dotIdx);
+    return `${stem}_${timestampSecs}_${cleanUuid}${ext}`;
+  }
+  return `${safeName}_${timestampSecs}_${cleanUuid}`;
+}
+
+/**
+ * Flushes the V8 garbage collector and yields to the macrotask queue between 50-page PDF batches
+ * so transient canvas/text buffers are reclaimed and massive medical textbooks never trigger V8 OOM crashes.
+ */
+export async function flushV8GarbageCollectorBetweenBatches(): Promise<void> {
+  try {
+    const g = globalThis as unknown as { gc?: () => void };
+    if (typeof g.gc === "function") {
+      g.gc();
+    }
+  } catch {
+    // Ignore if --expose-gc is not active
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
 /**
@@ -76,6 +124,7 @@ export function sanitizeIngestionStem(filename: string): string {
   const clean = withoutExt
     .trim()
     .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "");
   return clean || `ingested_${Date.now()}`;
 }
@@ -204,36 +253,54 @@ export async function extractPdfTextLocal(
 ): Promise<{
   text: string;
   pageCount: number;
+  batchesProcessed: number;
   first50Words: string;
   detectedLang: string;
   tesseractCache: TesseractCacheConfig;
 }> {
-  options.onProgress?.("Loading PDF document in memory via pdfjs-dist...");
+  options.onProgress?.("Loading PDF document in batched streaming mode via pdfjs-dist...");
+  const batchSize = Math.max(1, options.pageBatchSize ?? PDF_PAGE_BATCH_SIZE);
 
   try {
     const loadingTask = pdfjsLib.getDocument({
       data: pdfBytes,
       disableFontFace: true,
+      disableAutoFetch: true,
+      disableStream: false,
     });
     const pdfDoc = await loadingTask.promise;
     const numPages = pdfDoc.numPages || 1;
     const pageTexts: string[] = [];
     let collectedWords: string[] = [];
+    let batchesProcessed = 0;
 
-    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-      options.onProgress?.(`Extracting PDF page ${pageNum}/${numPages}...`);
-      const page = await pdfDoc.getPage(pageNum);
-      const textContent = await page.getTextContent();
-      const strings = (textContent.items || [])
-        .map((item: any) => (typeof item.str === "string" ? item.str : ""))
-        .filter(Boolean);
-      const joinedPage = strings.join(" ").replace(/\s+/g, " ").trim();
-      if (joinedPage) {
-        pageTexts.push(joinedPage);
-        if (collectedWords.length < 50) {
-          collectedWords = collectedWords.concat(joinedPage.split(/\s+/).filter(Boolean));
+    for (let batchStart = 1; batchStart <= numPages; batchStart += batchSize) {
+      const batchEnd = Math.min(numPages, batchStart + batchSize - 1);
+      batchesProcessed++;
+      options.onProgress?.(
+        `Processing PDF batch #${batchesProcessed} (pages ${batchStart}-${batchEnd} of ${numPages})...`
+      );
+
+      for (let pageNum = batchStart; pageNum <= batchEnd; pageNum++) {
+        options.onProgress?.(`Extracting PDF page ${pageNum}/${numPages}...`);
+        const page = await pdfDoc.getPage(pageNum);
+        const textContent = await page.getTextContent();
+        const strings = (textContent.items || [])
+          .map((item: any) => (typeof item.str === "string" ? item.str : ""))
+          .filter(Boolean);
+        const joinedPage = strings.join(" ").replace(/\s+/g, " ").trim();
+        if (joinedPage) {
+          pageTexts.push(joinedPage);
+          if (collectedWords.length < 50) {
+            collectedWords = collectedWords.concat(joinedPage.split(/\s+/).filter(Boolean));
+          }
         }
+        await (page as any).cleanup?.();
       }
+
+      await (pdfDoc as any).cleanup?.();
+      await flushV8GarbageCollectorBetweenBatches();
+      options.onBatchFlushed?.(batchesProcessed, batchStart, batchEnd);
     }
 
     const first50Words = collectedWords.slice(0, 50).join(" ");
@@ -246,6 +313,7 @@ export async function extractPdfTextLocal(
       return {
         text: combinedText,
         pageCount: numPages,
+        batchesProcessed,
         first50Words,
         detectedLang: activeLang,
         tesseractCache,
@@ -259,6 +327,7 @@ export async function extractPdfTextLocal(
     return {
       text: ocrFallback.text,
       pageCount: numPages,
+      batchesProcessed,
       first50Words,
       detectedLang: activeLang,
       tesseractCache: ocrFallback.tesseractCache,
@@ -275,6 +344,7 @@ export async function extractPdfTextLocal(
       return {
         text: printable,
         pageCount: 1,
+        batchesProcessed: 1,
         first50Words,
         detectedLang: activeLang,
         tesseractCache,
@@ -288,6 +358,7 @@ export async function extractPdfTextLocal(
     return {
       text: ocrFallback.text,
       pageCount: 1,
+      batchesProcessed: 1,
       first50Words,
       detectedLang: activeLang,
       tesseractCache: ocrFallback.tesseractCache,
@@ -427,10 +498,20 @@ export async function ingestDroppedFile(
     ? `${sanitizeIngestionStem(options.targetVaultPrefix)}_`
     : "";
   const sanitizedTargetFilename = sanitizeRawAssetFilename(`${prefix}${filename}`);
+  const uniqueRawAssetFilename = appendUniqueTimestampUuid(
+    sanitizedTargetFilename,
+    options.timestampSecs,
+    options.shortUuid
+  );
   const rawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${sanitizedTargetFilename}`;
+  const uniqueRawAssetRelPath = `${RAW_ASSETS_SUBDIR}/${uniqueRawAssetFilename}`;
   const savedRawAssetPath = await resolveAppDataSubPath(
     RAW_ASSETS_SUBDIR,
     sanitizedTargetFilename
+  );
+  const uniqueRawAssetPath = await resolveAppDataSubPath(
+    RAW_ASSETS_SUBDIR,
+    uniqueRawAssetFilename
   );
   const markdownRelPath = `vault/${prefix}${stem}.md`;
   const savedMarkdownPath = await resolveAppDataSubPath("vault", `${prefix}${stem}.md`);
@@ -439,6 +520,7 @@ export async function ingestDroppedFile(
 
   try {
     await mkdir(RAW_ASSETS_SUBDIR, { baseDir: BaseDirectory.AppLocalData, recursive: true });
+    await writeFile(uniqueRawAssetRelPath, bytes, { baseDir: BaseDirectory.AppLocalData });
     await writeFile(rawAssetRelPath, bytes, { baseDir: BaseDirectory.AppLocalData });
   } catch {
     // Safe fallback in headless environment
@@ -449,7 +531,7 @@ export async function ingestDroppedFile(
     /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(lower) || file.type.startsWith("image/");
 
   if (isPdf) {
-    const { text, pageCount, first50Words, detectedLang, tesseractCache } =
+    const { text, pageCount, batchesProcessed, first50Words, detectedLang, tesseractCache } =
       await extractPdfTextLocal(bytes, options);
     const verbatimText = text.trim();
 
@@ -467,6 +549,8 @@ export async function ingestDroppedFile(
       fileCategory: "pdf",
       extractedText: verbatimText,
       savedRawAssetPath,
+      uniqueRawAssetPath,
+      uniqueRawAssetFilename,
       savedMarkdownPath,
       ocrLanguage: detectedLang,
       detectedIsoLang: detectedLang,
@@ -474,6 +558,7 @@ export async function ingestDroppedFile(
       tesseractCachePath: tesseractCache.cachePath,
       localTrainedDataUsed: tesseractCache.localTrainedDataAvailable,
       pageCount,
+      batchesProcessed,
     };
   }
 

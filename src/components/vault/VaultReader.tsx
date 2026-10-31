@@ -2,7 +2,77 @@ import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Database from "@tauri-apps/plugin-sql";
 import ReactMarkdown from "react-markdown";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { Rnd } from "react-rnd";
+
+/**
+ * Strict `rehype-sanitize` schema for `VaultReader.tsx`:
+ * Allows structural Markdown elements (headers, bold, italics, lists, blockquotes, code, tables, safe links/images)
+ * while stripping all `<script>`, `<iframe>`, `<object>`, `<embed>`, `<style>`, and inline event attributes (`onerror`, `onload`, `onclick`).
+ */
+export const VAULT_REHYPE_SANITIZE_SCHEMA = {
+  ...defaultSchema,
+  tagNames: [
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "p",
+    "strong",
+    "b",
+    "em",
+    "i",
+    "ul",
+    "ol",
+    "li",
+    "blockquote",
+    "code",
+    "pre",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "td",
+    "a",
+    "img",
+    "hr",
+    "br",
+    "del",
+    "sup",
+    "sub",
+    "span",
+  ],
+  strip: ["script", "iframe", "object", "embed", "style", "form", "input", "button"],
+  attributes: {
+    ...defaultSchema.attributes,
+    "*": ["className", "id"],
+    a: ["href", "title"],
+    img: ["src", "alt", "title", "width", "height"],
+    th: ["align"],
+    td: ["align"],
+    code: ["className"],
+  },
+  protocols: {
+    href: ["http", "https", "mailto"],
+    src: ["http", "https", "applocaldata", "data"],
+  },
+};
+
+/**
+ * Sanitizes raw Markdown/HTML before rendering to ensure malicious `<script>`, `<iframe>`,
+ * and `onerror`/`onload` attributes are stripped even if raw HTML is embedded in a note.
+ */
+export function sanitizeVaultMarkdownXss(rawMarkdown: string): string {
+  return (rawMarkdown || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<script\b[^>]*\/?>/gi, "")
+    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, "")
+    .replace(/<iframe\b[^>]*\/?>/gi, "")
+    .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+}
 
 export interface MarkdownFootnoteEntry {
   id: string;
@@ -575,7 +645,7 @@ export const VaultReader: React.FC<VaultReaderProps> = ({
           </MilkdownProvider>
         ) : (
           <div style={{ color: "#f8fafc" }}>
-            <ReactMarkdown>{content}</ReactMarkdown>
+            <ReactMarkdown rehypePlugins={[[rehypeSanitize, VAULT_REHYPE_SANITIZE_SCHEMA]]}>{sanitizeVaultMarkdownXss(content)}</ReactMarkdown>
           </div>
         )}
       </div>

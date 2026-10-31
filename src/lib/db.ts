@@ -50,6 +50,15 @@ function createMemorySqliteAdapter(): SqliteAdapter {
         const removed = memoryQueueStore.splice(0, Math.max(0, dropLimit));
         return { rowsAffected: removed.length };
       }
+      if (/^DELETE FROM srs_sync_queue WHERE id = \?$/i.test(normalized)) {
+        const targetId = String(bindValues[0] ?? "");
+        const idx = memoryQueueStore.findIndex((r) => r.id === targetId);
+        if (idx >= 0) {
+          memoryQueueStore.splice(idx, 1);
+          return { rowsAffected: 1 };
+        }
+        return { rowsAffected: 0 };
+      }
       if (/^DELETE FROM srs_sync_queue$/i.test(normalized)) {
         const len = memoryQueueStore.length;
         memoryQueueStore.length = 0;
@@ -209,3 +218,18 @@ export async function enqueueCardsIntoSrsSyncQueue(
     evictedCount: enforcement.evictedCount,
   };
 }
+
+export async function deleteSrsSyncQueueRowsByIds(
+  ids: string[],
+  adapter?: SqliteAdapter
+): Promise<number> {
+  if (!ids || ids.length === 0) return 0;
+  const conn = adapter ?? (await getSqliteConnection());
+  let deleted = 0;
+  for (const id of ids) {
+    await conn.execute("DELETE FROM srs_sync_queue WHERE id = ?", [id]);
+    deleted++;
+  }
+  return deleted;
+}
+

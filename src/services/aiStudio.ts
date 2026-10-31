@@ -569,3 +569,99 @@ export async function executeOmnibarCanvasCommand(
     engineUsed: apiKey ? GEMMA_31B_MODEL_ID : "local-deterministic-fallback",
   };
 }
+
+export const MAX_RETRIES = 3;
+export const VERBATIM_EXTRACTION_FAILED_CODE = "VERBATIM_EXTRACTION_FAILED";
+export const VERBATIM_EXTRACTION_FAILED_EVENT = "convergence:verbatim-extraction-failed";
+
+export class VerbatimExtractionFailedError extends Error {
+  public readonly code = VERBATIM_EXTRACTION_FAILED_CODE;
+  public readonly attempts: number;
+
+  constructor(
+    message: string = "VERBATIM_EXTRACTION_FAILED: Gemma failed the word-count parity check 3 consecutive times.",
+    attempts: number = MAX_RETRIES
+  ) {
+    super(message);
+    this.name = VERBATIM_EXTRACTION_FAILED_CODE;
+    this.attempts = attempts;
+    Object.setPrototypeOf(this, VerbatimExtractionFailedError.prototype);
+  }
+}
+
+export function countNonEmptyWords(text: string): number {
+  return (text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+export function checkWordCountParity(
+  sourceText: string,
+  extractedText: string,
+  minParityRatio: number = 0.85
+): boolean {
+  const sourceCount = countNonEmptyWords(sourceText);
+  const extractedCount = countNonEmptyWords(extractedText);
+  if (sourceCount === 0) return extractedCount === 0;
+  if (extractedCount === 0) return false;
+  const ratio = Math.min(sourceCount, extractedCount) / Math.max(sourceCount, extractedCount);
+  return ratio >= minParityRatio;
+}
+
+/**
+ * Runs Gemma 4 31B IT verbatim text extraction with a strict `MAX_RETRIES = 3` circuit breaker.
+ * If Gemma fails the word-count parity check `3` consecutive times (e.g., due to corrupted/garbage OCR),
+ * immediately kills the retry loop, alerts the user, and throws `VerbatimExtractionFailedError` (`VERBATIM_EXTRACTION_FAILED`)
+ * to prevent infinite API quota burn.
+ */
+export async function extractVerbatimWithGemma(
+  rawOcrText: string,
+  options: {
+    apiKey?: string;
+    fetchImpl?: typeof fetch;
+    minParityRatio?: number;
+    maxRetries?: number;
+    onAlert?: (message: string) => void;
+  } = {}
+): Promise<{ text: string; attempts: number }> {
+  const limit = Math.min(MAX_RETRIES, Math.max(1, options.maxRetries ?? MAX_RETRIES));
+  const minParity = options.minParityRatio ?? 0.85;
+  const systemPrompt = [
+    "You are the Convergence Verbatim Medical Transcription Engine (Gemma 4 31B IT).",
+    "Clean OCR layout artifacts while preserving 100% verbatim word-count parity with the input text.",
+    "Do NOT summarize, truncate, or omit any words.",
+  ].join(" ");
+
+  for (let attempt = 1; attempt <= limit; attempt++) {
+    const candidate = await generateWithGemma31b(
+      rawOcrText,
+      systemPrompt,
+      {
+        apiKey: options.apiKey,
+        fetchImpl: options.fetchImpl,
+        temperature: 0.0,
+      }
+    );
+
+    if (checkWordCountParity(rawOcrText, candidate, minParity)) {
+      return { text: candidate.trim(), attempts: attempt };
+    }
+  }
+
+  const alertMsg = `${VERBATIM_EXTRACTION_FAILED_CODE}: Gemma failed word-count parity check ${limit} consecutive times. Circuit breaker tripped to protect daily API quota.`;
+  options.onAlert?.(alertMsg);
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+    try {
+      window.dispatchEvent(
+        new CustomEvent(VERBATIM_EXTRACTION_FAILED_EVENT, {
+          detail: { code: VERBATIM_EXTRACTION_FAILED_CODE, attempts: limit, message: alertMsg },
+        })
+      );
+    } catch {
+      // Ignore in headless environment
+    }
+  }
+  throw new VerbatimExtractionFailedError(alertMsg, limit);
+}
+

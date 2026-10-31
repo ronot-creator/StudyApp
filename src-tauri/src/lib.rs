@@ -135,23 +135,66 @@ pub fn resolve_standard_os_appdata_dir(app: Option<&tauri::AppHandle>) -> PathBu
     std::env::temp_dir().join("com.convergence.studyapp")
 }
 
-pub fn read_custom_drive_from_bootstrap(standard_dir: &Path) -> Option<PathBuf> {
+pub const CUSTOM_DRIVE_DISCONNECTED_CODE: &str = "CUSTOM_DRIVE_DISCONNECTED";
+
+/// Checks `storage_config.json` and verifies whether the configured custom target drive is currently mounted/reachable.
+/// If the custom path is unmounted/missing (e.g., an unplugged external SSD), returns an error tuple `(code, message)`
+/// instead of calling `.unwrap()` and panicking.
+pub fn check_custom_drive_mount_status(
+    standard_dir: &Path,
+) -> Result<Option<PathBuf>, (String, String)> {
     let cfg_path = standard_dir.join(STORAGE_CONFIG_FILENAME);
-    let metadata = std::fs::metadata(&cfg_path).ok()?;
+    let metadata = match std::fs::metadata(&cfg_path) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
     if metadata.len() as usize > MAX_STORAGE_CONFIG_BYTES {
-        return None;
+        return Err((
+            "STORAGE_CONFIG_TOO_LARGE".to_string(),
+            "storage_config.json exceeds 1KB safety limit.".to_string(),
+        ));
     }
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let target = parsed.get("customTargetDir")?.as_str()?.trim();
+    let raw = std::fs::read_to_string(&cfg_path).map_err(|e| {
+        (
+            "STORAGE_CONFIG_READ_ERROR".to_string(),
+            format!("Failed to read storage_config.json: {e}"),
+        )
+    })?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        (
+            "STORAGE_CONFIG_PARSE_ERROR".to_string(),
+            format!("Invalid JSON in storage_config.json: {e}"),
+        )
+    })?;
+    let target = parsed
+        .get("customTargetDir")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
     if target.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(target))
+        return Ok(None);
+    }
+    let target_path = PathBuf::from(target);
+    if !target_path.exists() {
+        return Err((
+            CUSTOM_DRIVE_DISCONNECTED_CODE.to_string(),
+            format!(
+                "Custom target drive '{}' is currently unmounted or disconnected.",
+                target
+            ),
+        ));
+    }
+    Ok(Some(target_path))
+}
+
+pub fn read_custom_drive_from_bootstrap(standard_dir: &Path) -> Option<PathBuf> {
+    match check_custom_drive_mount_status(standard_dir) {
+        Ok(Some(valid_path)) => Some(valid_path),
+        Ok(None) | Err(_) => None,
     }
 }
 
-/// Resolves the dynamic OS `$APPLOCALDATA` root directory for Convergence.
+/// Resolves the dynamic OS `$APPLOCALDATA` root directory for Convergence (`app.path().app_local_data_dir()`).
 /// Checks the 1KB `storage_config.json` bootstrap file first before falling back to OS `$APPLOCALDATA`.
 pub fn resolve_app_local_data_dir(app: Option<&tauri::AppHandle>) -> PathBuf {
     let standard = resolve_standard_os_appdata_dir(app);
@@ -480,17 +523,91 @@ pub fn sanitize_raw_asset_filename(incoming_name: &str) -> Result<String, String
     Ok(safe)
 }
 
-/// Enforces path traversal sanitization at the Rust layer before `std::fs::copy` is executed,
-/// verifying that the destination path resolves strictly as a direct child of `$APPLOCALDATA/raw_assets`.
+pub const IPC_RATE_LIMIT_MAX_CALLS_PER_SEC: u32 = 5;
+pub const IPC_RATE_LIMIT_EXCEEDED_CODE: &str = "IPC_RATE_LIMIT_EXCEEDED";
+
+static SHORTHAND_RATE_LIMITER: std::sync::OnceLock<
+    Mutex<HashMap<String, (std::time::Instant, u32)>>,
+> = std::sync::OnceLock::new();
+
+/// Rate-limiter for `resolve_shorthand_query`.
+/// Uses a static `Mutex<HashMap<String, (Instant, u32)>>` to track invocation frequency per caller.
+/// If an AI WebView calls `resolve_shorthand_query` more than 5 times per second, immediately returns `IPC_RATE_LIMIT_EXCEEDED`.
+pub fn check_shorthand_ipc_rate_limit(caller_id: &str) -> Result<(), String> {
+    let map_mutex = SHORTHAND_RATE_LIMITER.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map_mutex
+        .lock()
+        .map_err(|e| format!("Rate-limiter mutex lock error: {e}"))?;
+    let now = std::time::Instant::now();
+    let entry = guard
+        .entry(caller_id.to_string())
+        .or_insert((now, 0));
+
+    if now.duration_since(entry.0) < std::time::Duration::from_secs(1) {
+        entry.1 += 1;
+        if entry.1 > IPC_RATE_LIMIT_MAX_CALLS_PER_SEC {
+            return Err(format!(
+                "{IPC_RATE_LIMIT_EXCEEDED_CODE}: resolve_shorthand_query exceeded {} calls/sec for '{caller_id}'",
+                IPC_RATE_LIMIT_MAX_CALLS_PER_SEC
+            ));
+        }
+    } else {
+        *entry = (now, 1);
+    }
+    Ok(())
+}
+
+/// Appends a unique Unix timestamp and 4-char short UUID to a sanitized filename
+/// before copying into `raw_assets` (e.g., `anatomy_1701234567_abc1.pdf`) to prevent silent overwrites.
+pub fn append_unique_timestamp_and_uuid(
+    sanitized_filename: &str,
+    timestamp_secs: u64,
+    short_uuid: &str,
+) -> String {
+    let clean_uuid: String = short_uuid
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(4)
+        .collect::<String>()
+        .to_lowercase();
+    let uuid_part = if clean_uuid.is_empty() {
+        "a1b2".to_string()
+    } else {
+        clean_uuid
+    };
+
+    if let Some((stem, ext)) = sanitized_filename.rsplit_once('.') {
+        if !stem.is_empty() && !ext.is_empty() {
+            return format!("{stem}_{timestamp_secs}_{uuid_part}.{ext}");
+        }
+    }
+    format!("{sanitized_filename}_{timestamp_secs}_{uuid_part}")
+}
+
+pub fn generate_unique_raw_asset_filename(incoming_name: &str) -> Result<String, String> {
+    let safe_base = sanitize_raw_asset_filename(incoming_name)?;
+    let now_dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ts_secs = now_dur.as_secs();
+    let nanos = now_dur.subsec_nanos();
+    let pid = std::process::id();
+    let short_uuid = format!("{:04x}", ((nanos ^ pid) & 0xffff));
+    Ok(append_unique_timestamp_and_uuid(&safe_base, ts_secs, &short_uuid))
+}
+
+/// Enforces path traversal sanitization and collision-free unique naming (`<stem>_<timestamp>_<uuid>.<ext>`)
+/// at the Rust layer before `std::fs::copy` is executed, verifying that the destination path resolves
+/// strictly as a direct child of `$APPLOCALDATA/raw_assets`.
 pub fn copy_to_raw_assets_sandboxed(
     base_dir: &Path,
     source_path: &Path,
     incoming_filename: &str,
 ) -> Result<PathBuf, String> {
     ensure_appdata_subdirs(base_dir)?;
-    let safe_filename = sanitize_raw_asset_filename(incoming_filename)?;
+    let unique_safe_filename = generate_unique_raw_asset_filename(incoming_filename)?;
     let raw_assets_dir = enforce_appdata_sandbox_with_root(base_dir, &base_dir.join("raw_assets"))?;
-    let target_path = raw_assets_dir.join(&safe_filename);
+    let target_path = raw_assets_dir.join(&unique_safe_filename);
 
     if target_path.parent() != Some(raw_assets_dir.as_path()) {
         return Err(format!(
@@ -601,6 +718,7 @@ fn resolve_shorthand_query(
     app: tauri::AppHandle,
     query: String,
 ) -> Result<serde_json::Value, String> {
+    check_shorthand_ipc_rate_limit("ai_webview")?;
     let cleaned_topic_owned = validate_shorthand_query_payload(&query)?;
     let cleaned_topic = cleaned_topic_owned.as_str();
     let app_data_dir = resolve_app_local_data_dir(Some(&app));
@@ -703,12 +821,18 @@ fn get_storage_config(app: tauri::AppHandle) -> Result<serde_json::Value, String
     let standard = resolve_standard_os_appdata_dir(Some(&app));
     let active = resolve_app_local_data_dir(Some(&app));
     let cfg_path = standard.join(STORAGE_CONFIG_FILENAME);
-    let has_custom = read_custom_drive_from_bootstrap(&standard).is_some();
+    let mount_status = check_custom_drive_mount_status(&standard);
+    let has_custom = matches!(mount_status, Ok(Some(_)));
+    let error_tuple = match mount_status {
+        Err((code, msg)) => Some((code, msg)),
+        Ok(_) => None,
+    };
     Ok(serde_json::json!({
         "config_file": cfg_path.to_string_lossy(),
         "standard_appdata_dir": standard.to_string_lossy(),
         "custom_target_dir": active.to_string_lossy(),
         "first_run_completed": has_custom,
+        "drive_error_tuple": error_tuple,
     }))
 }
 

@@ -1,6 +1,7 @@
 import { SrsCard } from "../types/study";
 import { GemmaFsrsCardPayload } from "./aiStudio";
 import {
+  deleteSrsSyncQueueRowsByIds,
   enqueueCardsIntoSrsSyncQueue,
   getSrsSyncQueueCount,
   getSrsSyncQueueRows,
@@ -296,3 +297,174 @@ export async function pushFlashcardsToAnki(
 }
 
 export { getSrsSyncQueueCount, getSrsSyncQueueRows };
+
+export const ANKI_SYNC_HEARTBEAT_INTERVAL_MS = 30_000;
+
+export interface AnkiSyncFlushOutcome {
+  reachable: boolean;
+  attemptedRows: number;
+  flushedRows: number;
+  remainingRows: number;
+}
+
+/**
+ * Background Heartbeat Worker (`AnkiSyncWorker`) that runs a lightweight `setInterval`
+ * (every 30 seconds by default), pings AnkiConnect (`http://127.0.0.1:8765`), and if reachable,
+ * `SELECT`s the oldest rows from `srs_sync_queue`, posts them to Anki via `addNotes`,
+ * and `DELETE`s them from `srs_sync_queue` on success.
+ */
+export class AnkiSyncWorker {
+  private timerId: ReturnType<typeof setInterval> | null = null;
+  private isFlushing = false;
+  private readonly deckName: string;
+  private readonly batchLimit: number;
+  private readonly endpoint: string;
+  private readonly fetchImpl?: typeof fetch;
+  private readonly dbAdapter?: SqliteAdapter;
+
+  constructor(
+    options: {
+      deckName?: string;
+      batchLimit?: number;
+      endpoint?: string;
+      fetchImpl?: typeof fetch;
+      dbAdapter?: SqliteAdapter;
+    } = {}
+  ) {
+    this.deckName = options.deckName || DEFAULT_CONVERGENCE_DECK;
+    this.batchLimit = options.batchLimit ?? 100;
+    this.endpoint = options.endpoint || ANKI_CONNECT_URL;
+    this.fetchImpl = options.fetchImpl;
+    this.dbAdapter = options.dbAdapter;
+  }
+
+  public start(intervalMs: number = ANKI_SYNC_HEARTBEAT_INTERVAL_MS): void {
+    this.stop();
+    this.timerId = setInterval(() => {
+      void this.flushOnce();
+    }, intervalMs);
+  }
+
+  public stop(): void {
+    if (this.timerId !== null) {
+      clearInterval(this.timerId);
+      this.timerId = null;
+    }
+  }
+
+  public isRunning(): boolean {
+    return this.timerId !== null;
+  }
+
+  public async flushOnce(): Promise<AnkiSyncFlushOutcome> {
+    if (this.isFlushing) {
+      const remaining = await getSrsSyncQueueCount(this.dbAdapter);
+      return {
+        reachable: false,
+        attemptedRows: 0,
+        flushedRows: 0,
+        remainingRows: remaining,
+      };
+    }
+
+    this.isFlushing = true;
+    try {
+      const status = await checkAnkiConnectStatus({
+        endpoint: this.endpoint,
+        fetchImpl: this.fetchImpl,
+      });
+      if (!status.connected) {
+        const remaining = await getSrsSyncQueueCount(this.dbAdapter);
+        return {
+          reachable: false,
+          attemptedRows: 0,
+          flushedRows: 0,
+          remainingRows: remaining,
+        };
+      }
+
+      const allRows = await getSrsSyncQueueRows(this.dbAdapter);
+      const batchRows = allRows.slice(0, this.batchLimit);
+      if (batchRows.length === 0) {
+        emitAnkiQueueState({
+          queuedCount: 0,
+          lastError: null,
+          bannerMessage: null,
+        });
+        return {
+          reachable: true,
+          attemptedRows: 0,
+          flushedRows: 0,
+          remainingRows: 0,
+        };
+      }
+
+      await ensureConvergenceDeckExists(this.deckName, {
+        endpoint: this.endpoint,
+        fetchImpl: this.fetchImpl,
+      });
+
+      const notes: AnkiNoteInput[] = batchRows.map((row) => {
+        let parsed: Record<string, any> = {};
+        try {
+          parsed = JSON.parse(row.payload);
+        } catch {
+          parsed = { frontPrompt: row.payload, markScheme: row.payload };
+        }
+        const sysTag = String(parsed.organSystem || "General")
+          .toLowerCase()
+          .replace(/[^a-z0-9_]+/g, "_");
+        return {
+          deckName: this.deckName,
+          modelName: "Basic",
+          fields: {
+            Front: String(parsed.frontPrompt || parsed.Front || row.id),
+            Back: String(parsed.markScheme || parsed.Back || ""),
+          },
+          options: {
+            allowDuplicate: false,
+            duplicateScope: "deck",
+          },
+          tags: ["convergence", sysTag],
+        };
+      });
+
+      await invokeAnkiConnect<Array<number | null>>(
+        "addNotes",
+        { notes },
+        { endpoint: this.endpoint, fetchImpl: this.fetchImpl }
+      );
+
+      const idsToDelete = batchRows.map((r) => r.id);
+      await deleteSrsSyncQueueRowsByIds(idsToDelete, this.dbAdapter);
+
+      const remainingRows = await getSrsSyncQueueCount(this.dbAdapter);
+      emitAnkiQueueState({
+        queuedCount: remainingRows,
+        lastError: null,
+        bannerMessage:
+          remainingRows > 0
+            ? `${remainingRows} flashcard(s) remaining in srs_sync_queue.`
+            : null,
+      });
+
+      return {
+        reachable: true,
+        attemptedRows: batchRows.length,
+        flushedRows: idsToDelete.length,
+        remainingRows,
+      };
+    } catch {
+      const remaining = await getSrsSyncQueueCount(this.dbAdapter);
+      return {
+        reachable: false,
+        attemptedRows: 0,
+        flushedRows: 0,
+        remainingRows: remaining,
+      };
+    } finally {
+      this.isFlushing = false;
+    }
+  }
+}
+

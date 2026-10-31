@@ -33,10 +33,8 @@ import {
 } from "./services/ingestion/specimenSourcing";
 import {
   ACTIVE_AI_PROVIDER_STORAGE_KEY,
-  addOrPinAiProvider,
   loadSavedAiProviders,
   removeCustomAiProvider,
-  resolveChatbotSearchCandidates,
 } from "./services/aiProviderRegistry";
 
 type WorkspaceTab = "vault" | "srs" | "mindmap" | "specimens" | "integrations";
@@ -69,8 +67,6 @@ export default function App() {
   );
   const [showAddChatbotModal, setShowAddChatbotModal] = useState<boolean>(false);
   const [showDriveWizard, setShowDriveWizard] = useState<boolean>(false);
-  const [chatbotSearchQuery, setChatbotSearchQuery] = useState<string>("");
-  const [customChatbotUrl, setCustomChatbotUrl] = useState<string>("");
 
   const [leftWidthPct, setLeftWidthPct] = useState<number>(56);
   const [preMaximizeWidthPct, setPreMaximizeWidthPct] = useState<number>(56);
@@ -250,19 +246,6 @@ export default function App() {
     }
   };
 
-  const handleAddAndPinChatbot = async (candidate: {
-    id?: string;
-    label: string;
-    url: string;
-  }) => {
-    const { providers, added } = await addOrPinAiProvider(candidate, aiProviders);
-    setAiProviders(providers);
-    setShowAddChatbotModal(false);
-    setChatbotSearchQuery("");
-    setCustomChatbotUrl("");
-    await handleSwitchAiProvider(added.id, added.url);
-  };
-
   const handleRemoveCustomChatbot = async (providerId: string) => {
     const updated = await removeCustomAiProvider(providerId, aiProviders);
     setAiProviders(updated);
@@ -317,7 +300,6 @@ export default function App() {
 
   const inlineAiTabs = aiProviders.slice(0, MAX_INLINE_PINNED_AI_TABS);
   const overflowAiTabs = aiProviders.slice(MAX_INLINE_PINNED_AI_TABS);
-  const searchCandidates = resolveChatbotSearchCandidates(chatbotSearchQuery);
 
   return (
     <ApiKeyErrorBoundary>
@@ -569,7 +551,7 @@ export default function App() {
                         border: "1px solid rgba(255, 255, 255, 0.08)",
                       }}
                     >
-                      <strong>{repo.name}</strong> — <span style={{ color: "#94a3b8" }}>{repo.license}</span>
+                      <strong>{repo.name}</strong> — <span style={{ color: "#94a3b8" }}>{repo.license_policy}</span>
                     </div>
                   ))}
                 </div>
@@ -693,13 +675,14 @@ export default function App() {
 
           <AddAiModal
             isOpen={showAddChatbotModal}
-            searchQuery={chatbotSearchQuery}
-            customUrl={customChatbotUrl}
-            candidates={searchCandidates}
-            onSearchQueryChange={setChatbotSearchQuery}
-            onCustomUrlChange={setCustomChatbotUrl}
-            onSelectCandidate={(c) => void handleAddAndPinChatbot(c)}
+            existingProviders={aiProviders}
             onClose={() => setShowAddChatbotModal(false)}
+            onProviderAdded={(updatedProviders, addedProvider, statusMsg) => {
+              setAiProviders(updatedProviders);
+              setShowAddChatbotModal(false);
+              setAiPanelStatusText(statusMsg);
+              void handleSwitchAiProvider(addedProvider.id, addedProvider.url);
+            }}
           />
 
           <div
